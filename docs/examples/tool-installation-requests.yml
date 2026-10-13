@@ -1,6 +1,7 @@
 # Opens an issue or a pull request in this repository for each new tool
 # installation request on a Galaxy server, then tells the requester where it is
-# handled. See the consume-tool-installation-requests page of the ephemeris docs.
+# handled. Needs tool-installation-requests.sh from the ephemeris docs in .github/.
+# See the consume-tool-installation-requests page of the ephemeris docs.
 name: Tool installation requests
 
 on:
@@ -24,6 +25,7 @@ jobs:
       pull-requests: write # open pull requests
     env:
       EPHEMERIS_GALAXY: https://galaxy.example.org
+      # Leave TOOLS_FILE out to open only issues, or set APPLY_COMMAND for other repository layouts.
       TOOLS_FILE: requested_tools.yaml
     steps:
       - uses: actions/checkout@v7.0.1
@@ -36,52 +38,8 @@ jobs:
       - name: Open issues and pull requests
         env:
           EPHEMERIS_API_KEY: ${{ secrets.GALAXY_ADMIN_API_KEY }}
-          GH_TOKEN: ${{ github.token }}
+          FORGE_TOKEN: ${{ github.token }}
         run: |
-          gh auth setup-git
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          requests() { consume-tool-installation-requests "$@"; }
-
-          handle() {
-            id=$(jq -r .notification_id item.json)
-            action=$(jq -r .action item.json)
-            jq -r .title item.json > title.txt
-            jq -r .body item.json > body.md
-            if [ "$action" = pr ]; then
-              branch="tool-request/$id"
-              url=$(gh pr list --head "$branch" --state all --json url --jq '.[0].url // empty') || return 1
-              if [ -z "$url" ]; then
-                git switch --quiet -C "$branch" "$base" || return 1
-                jq -s . item.json | requests render-yaml --tools-file "$TOOLS_FILE" -o "$TOOLS_FILE" || return 1
-                git add "$TOOLS_FILE" || return 1
-                if git diff --cached --quiet; then
-                  # The tool list has these revisions already, so let an admin look at it.
-                  action=issue
-                else
-                  git commit --quiet -F title.txt && git push --quiet --force origin "$branch" || return 1
-                  url=$(gh pr create --head "$branch" --base "$base" --title "$(cat title.txt)" --body-file body.md) || return 1
-                fi
-              fi
-            fi
-            if [ "$action" = issue ]; then
-              url=$(gh issue list --state all --search "$id in:body" --json url --jq '.[0].url // empty') || return 1
-              if [ -z "$url" ]; then
-                url=$(gh issue create --title "$(cat title.txt)" --body-file body.md) || return 1
-              fi
-            fi
-            requests reply --notification-id "$id" --url "$url" && requests mark-seen "$id"
-          }
-
-          base=$(git branch --show-current)
-          requests emit > requests.json
-          failed=0
-          for i in $(seq 0 $(( $(jq length requests.json) - 1 ))); do
-            jq ".[$i]" requests.json > item.json
-            if ! handle; then
-              echo "::warning::Request $(jq -r .notification_id item.json) failed, the next run tries again"
-              failed=1
-            fi
-            git switch --quiet --discard-changes "$base"
-          done
-          exit $failed
+          bash .github/tool-installation-requests.sh
