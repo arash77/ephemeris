@@ -7,6 +7,11 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from http.server import (
     BaseHTTPRequestHandler,
     ThreadingHTTPServer,
@@ -20,6 +25,7 @@ import pytest
 
 SCRIPT = pathlib.Path(__file__).parent.parent / "docs" / "examples" / "tool-installation-requests.sh"
 LABEL = "tool installation request"
+ANSWERED = "tool installation request answered"
 TOOLS = """\
 tools:
 - name: fastp
@@ -33,57 +39,111 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class FakeForge:
     """The REST API of one GitHub repository or GitLab project, in memory."""
 
     def __init__(self, kind):
         self.kind = kind
         self.prefix = "/repos/org/tools" if kind == "github" else "/projects/7"
-        self.issues = []
-        self.changes = []
+        self.items = []
 
-    def add_issue(self, body, labels=(LABEL,)):
-        url = f"https://forge.test/org/tools/issues/{len(self.issues) + 1}"
-        self.issues.append({"url": url, "body": body, "labels": list(labels)})
-        return url
+    def add(self, kind, body="", labels=(LABEL,), state="open", closed_at=None, branch=None, from_fork=False, **fields):
+        number = len(self.items) + 1
+        path = "issues" if kind == "issue" else "pull"
+        item = dict(
+            fields,
+            number=number,
+            url=f"https://forge.test/org/tools/{path}/{number}",
+            kind=kind,
+            body=body,
+            labels=list(labels),
+            state=state,
+            created_at=fields.get("created_at", "2026-10-01T00:00:00Z"),
+            closed_at=closed_at,
+            branch=branch,
+            from_fork=from_fork,
+        )
+        self.items.append(item)
+        return item
 
-    def add_change(self, branch, from_fork=False, **fields):
-        url = f"https://forge.test/org/tools/pull/{len(self.changes) + 1}"
-        self.changes.append(dict(fields, url=url, branch=branch, from_fork=from_fork))
-        return url
+    def _github(self, item):
+        rendered = {
+            "html_url": item["url"],
+            "number": item["number"],
+            "body": item["body"],
+            "state": "open" if item["state"] == "open" else "closed",
+            "labels": [{"name": label} for label in item["labels"]],
+            "created_at": item["created_at"],
+            "closed_at": item["closed_at"],
+        }
+        if item["kind"] == "change":
+            rendered["pull_request"] = {"merged_at": item["closed_at"] if item["state"] == "merged" else None}
+        return rendered
+
+    def _gitlab(self, item):
+        state = {"open": "opened"}.get(item["state"], item["state"])
+        rendered = {
+            "web_url": item["url"],
+            "iid": item["number"],
+            "description": item["body"],
+            "state": state,
+            "labels": item["labels"],
+            "created_at": item["created_at"],
+            "closed_at": None if item["state"] == "merged" else item["closed_at"],
+        }
+        if item["kind"] == "change":
+            rendered.update(
+                merged_at=item["closed_at"] if item["state"] == "merged" else None,
+                source_project_id=8 if item["from_fork"] else 7,
+                target_project_id=7,
+            )
+        return rendered
 
     def handle(self, method, path, query, payload):
         resource = path.removeprefix(self.prefix)
+        render = self._github if self.kind == "github" else self._gitlab
         if method == "POST" and resource == "/labels":
             return 201, {}
-        if method == "GET" and resource == "/issues":
+        if method == "GET" and resource in ("/issues", "/merge_requests") and "labels" in query:
+            kind = "change" if resource == "/merge_requests" else "issue"
+            # GitHub lists pull requests with the issues.
+            found = [
+                i for i in self.items if query["labels"] in i["labels"] and (self.kind == "github" or i["kind"] == kind)
+            ]
             per_page = int(query["per_page"])
             start = (int(query["page"]) - 1) * per_page
-            labeled = [i for i in self.issues if query["labels"] in i["labels"]]
-            issues = labeled[start:][:per_page]
-            if self.kind == "github":
-                return 200, [{"html_url": i["url"], "body": i["body"]} for i in issues]
-            return 200, [{"web_url": i["url"], "description": i["body"]} for i in issues]
+            return 200, [render(i) for i in found[start:][:per_page]]
         if method == "POST" and resource == "/issues":
-            if self.kind == "github":
-                return 201, {"html_url": self.add_issue(payload["body"], payload["labels"])}
-            return 201, {"web_url": self.add_issue(payload["description"], payload["labels"].split(","))}
+            body = payload.get("body", payload.get("description"))
+            labels = payload["labels"] if self.kind == "github" else payload["labels"].split(",")
+            return 201, render(self.add("issue", body, labels, title=payload["title"]))
         if method == "GET" and resource in ("/pulls", "/merge_requests"):
             if self.kind == "github":
                 # GitHub matches owner:branch, so pull requests from forks have another owner.
                 owner, _, branch = query["head"].partition(":")
-                found = [c for c in self.changes if c["branch"] == branch and owner == "org" and not c["from_fork"]]
-                return 200, [{"html_url": c["url"]} for c in found]
-            found = [c for c in self.changes if c["branch"] == query["source_branch"]]
-            return 200, [
-                {"web_url": c["url"], "source_project_id": 8 if c["from_fork"] else 7, "target_project_id": 7}
-                for c in found
-            ]
+                found = [i for i in self.items if i["branch"] == branch and owner == "org" and not i["from_fork"]]
+                return 200, [render(i) for i in found]
+            return 200, [render(i) for i in self.items if i["branch"] == query["source_branch"]]
         if method == "POST" and resource == "/pulls":
-            return 201, {"html_url": self.add_change(payload["head"], base=payload["base"], title=payload["title"])}
+            change = self.add("change", payload["body"], (), branch=payload["head"], base=payload["base"])
+            return 201, dict(render(change), title=payload["title"])
         if method == "POST" and resource == "/merge_requests":
-            url = self.add_change(payload["source_branch"], base=payload["target_branch"], title=payload["title"])
-            return 201, {"web_url": url}
+            change = self.add(
+                "change",
+                payload["description"],
+                payload["labels"].split(","),
+                branch=payload["source_branch"],
+                base=payload["target_branch"],
+            )
+            return 201, render(change)
+        if method in ("POST", "PUT") and resource.split("/")[1] in ("issues", "merge_requests"):
+            item = self.items[int(resource.split("/")[2]) - 1]
+            item["labels"] += payload["labels"] if self.kind == "github" else payload["add_labels"].split(",")
+            return 200, render(item)
         return 404, {"message": f"no fake for {method} {path}"}
 
 
@@ -112,7 +172,7 @@ def forge_server():
                 self.end_headers()
                 self.wfile.write(data)
 
-            do_GET = do_POST = _respond
+            do_GET = do_POST = do_PUT = _respond
 
             def log_message(self, format, *args):
                 pass
@@ -127,12 +187,35 @@ def forge_server():
         server.shutdown()
 
 
+def _body(notification_id):
+    return f"Tool installation request from Galaxy (notification `{notification_id}`).\n\nDetails."
+
+
 def _item(notification_id, action, title, tools=()):
-    body = f"Tool installation request from Galaxy (notification `{notification_id}`).\n\nDetails."
-    return {"notification_id": notification_id, "action": action, "title": title, "body": body, "tools": list(tools)}
+    return {
+        "notification_id": notification_id,
+        "action": action,
+        "title": title,
+        "body": _body(notification_id),
+        "tools": list(tools),
+    }
 
 
-def _run(tmp_path, requests, env, gitlab_ci=False):
+def _ci(kind, api, tmp_path):
+    """What GitHub Actions or GitLab CI tell a job, from which the script finds its settings."""
+    if kind == "github":
+        return {"GITHUB_ACTIONS": "true", "GITHUB_API_URL": api, "GITHUB_REPOSITORY": "org/tools"}
+    return {
+        "GITLAB_CI": "true",
+        "CI_API_V4_URL": api,
+        "CI_PROJECT_ID": "7",
+        "CI_SERVER_URL": f"file://{tmp_path}",
+        "CI_PROJECT_PATH": "origin",
+        "CI_COMMIT_BRANCH": "main",
+    }
+
+
+def _run(tmp_path, requests, env, gitlab_ci=False, installed=()):
     """Run the script in a clone of a tool list repository, with ephemeris answering for Galaxy."""
     subprocess.run(["git", "init", "--quiet", "--bare", "--initial-branch=main", tmp_path / "origin.git"], check=True)
     checkout = tmp_path / "checkout"
@@ -151,20 +234,25 @@ def _run(tmp_path, requests, env, gitlab_ci=False):
     if gitlab_ci:
         # GitLab CI checks out a commit, from a URL with a job token that cannot push.
         subprocess.run(["git", "switch", "--quiet", "--detach"], cwd=checkout, check=True)
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", "https://gitlab-ci-token:x@gitlab.invalid/org/tools.git"],
-            cwd=checkout,
-            check=True,
-        )
+        bad_origin = "https://gitlab-ci-token:x@gitlab.invalid/org/tools.git"
+        subprocess.run(["git", "remote", "set-url", "origin", bad_origin], cwd=checkout, check=True)
 
     (tmp_path / "requests.json").write_text(json.dumps(requests))
+    (tmp_path / "installed").write_text("".join(f"{i}\n" for i in installed))
+    log = tmp_path / "galaxy.log"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "consume-tool-installation-requests"
     stub.write_text(f"""#!/bin/bash
-printf '%s|' "$@" >> {tmp_path / "galaxy.log"}; echo >> {tmp_path / "galaxy.log"}
+printf '%s|' "$@" >> {log}; echo >> {log}
 case "$1" in
-  emit) cat {tmp_path / "requests.json"} ;;
+  emit)
+    while [ $# -gt 0 ]; do
+      [ "$1" = --handled ] && sed 's/$/|/; s/^/handled|/' "$2" >> {log}
+      shift
+    done
+    cat {tmp_path / "requests.json"} ;;
+  installed) grep -qx "$3" {tmp_path / "installed"} && echo yes || echo no ;;
   render-yaml) exec {sys.executable} -m ephemeris.tool_request_consumer "$@" ;;
 esac
 """)
@@ -183,10 +271,17 @@ esac
     }
     result = subprocess.run(["bash", SCRIPT], cwd=checkout, env=script_env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    calls = [line.split("|")[:-1] for line in (tmp_path / "galaxy.log").read_text().splitlines()]
-    replies = {args[2]: args[4] for args in calls if args[0] == "reply"}
-    seen = [args[1] for args in calls if args[0] == "mark-seen"]
-    return replies, seen, calls
+    return [line.split("|")[:-1] for line in log.read_text().splitlines()]
+
+
+def _replies(calls):
+    """Map notification ids to the URL and state that reply told."""
+    replies = {}
+    for args in calls:
+        if args[0] == "reply":
+            options = dict(zip(args[1::2], args[2::2]))
+            replies[options["--notification-id"]] = (options.get("--url"), options.get("--state", "handling"))
+    return replies
 
 
 @pytest.mark.parametrize("kind", ["github", "gitlab"])
@@ -194,12 +289,13 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
     forge, api = forge_server(kind)
     # The issue a run opened before it stopped, on the second page of the label's issues.
     for i in range(100):
-        forge.add_issue(f"Older request {i}")
+        forge.add("issue", f"Older request {i}", created_at="2026-09-01T00:00:00Z")
     # Issues without the label are not the script's.
-    forge.add_issue(_item("n5", "issue", "")["body"], labels=["question"])
-    reused_issue = forge.add_issue(_item("n2", "issue", "")["body"])
-    reused_change = forge.add_change("tool-request/n4")
-    forge.add_change("tool-request/n5", from_fork=True)
+    forge.add("issue", _body("n5"), labels=["question"])
+    reused_issue = forge.add("issue", _body("n2"))["url"]
+    # Opened before pull requests got the label.
+    reused_change = forge.add("change", _body("n4"), labels=(), branch="tool-request/n4")["url"]
+    forge.add("change", _body("n5"), labels=(), branch="tool-request/n5", from_fork=True)
     bwa = {
         "name": "bwa",
         "owner": "devteam",
@@ -217,35 +313,49 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
         _item("n5", "issue", "Install other"),
     ]
 
-    # The script finds out the forge, its API and the project in GitHub Actions and GitLab CI.
-    if kind == "github":
-        ci = {"GITHUB_ACTIONS": "true", "GITHUB_API_URL": api, "GITHUB_REPOSITORY": "org/tools"}
-    else:
-        ci = {
-            "GITLAB_CI": "true",
-            "CI_API_V4_URL": api,
-            "CI_PROJECT_ID": "7",
-            "CI_SERVER_URL": f"file://{tmp_path}",
-            "CI_PROJECT_PATH": "origin",
-            "CI_COMMIT_BRANCH": "main",
-        }
+    existing = len(forge.items)
+    env = dict(_ci(kind, api, tmp_path), TOOLS_FILE="tools.yaml")
+    calls = _run(tmp_path, requests, env, gitlab_ci=kind == "gitlab")
 
-    existing = len(forge.issues)
-    replies, seen, _ = _run(tmp_path, requests, dict(ci, TOOLS_FILE="tools.yaml"), gitlab_ci=kind == "gitlab")
-
-    [new_change] = [c for c in forge.changes if c["branch"] == "tool-request/n1"]
-    assert (new_change["base"], new_change["title"]) == ("main", "Install bwa 0.7.18")
+    # Requests an admin read in Galaxy are handled too, unless they have an issue or pull request.
+    [emit] = [args for args in calls if args[0] == "emit"]
+    assert emit[emit.index("--seen-since") + 1] == "2026-09-01T00:00:00Z"
+    assert [args[1] for args in calls if args[0] == "handled"] == ["n2"]
+    new = forge.items[existing:]
+    [new_change] = [i for i in new if i["branch"] == "tool-request/n1"]
+    assert (new_change["base"], new_change["labels"]) == ("main", [LABEL])
     pushed = subprocess.run(
         ["git", "show", "tool-request/n1:tools.yaml"], cwd=tmp_path / "origin.git", capture_output=True, text=True
     ).stdout
     assert "name: bwa" in pushed and "4a196b9c72c2" in pushed
-    assert replies["n1"] == new_change["url"]
-    assert replies["n2"] == reused_issue
-    assert replies["n4"] == reused_change
-    new_issues = {i["url"]: i for i in forge.issues[existing:]}
-    assert set(new_issues) == {replies["n3"], replies["n5"]}
+    replies = _replies(calls)
+    assert replies["n1"] == (new_change["url"], "handling")
+    assert replies["n2"] == (reused_issue, "handling")
+    assert replies["n4"] == (reused_change, "handling")
+    new_issues = {i["url"]: i for i in new if i["kind"] == "issue"}
+    assert set(new_issues) == {replies["n3"][0], replies["n5"][0]}
     assert all(i["labels"] == [LABEL] for i in new_issues.values())
-    assert seen == ["n1", "n2", "n3", "n4", "n5"]
+    assert [args[1] for args in calls if args[0] == "mark-seen"] == ["n1", "n2", "n3", "n4", "n5"]
+
+
+@pytest.mark.parametrize("kind", ["github", "gitlab"])
+def test_script_tells_requesters_how_their_request_ended(tmp_path, forge_server, kind):
+    forge, api = forge_server(kind)
+    rejected = forge.add("issue", _body("c1"), state="closed", closed_at=_ago(1))
+    merged = forge.add("change", _body("c2"), state="merged", closed_at=_ago(1), branch="tool-request/c2")
+    # Merged, but nothing installed it yet.
+    forge.add("change", _body("c3"), state="merged", closed_at=_ago(1), branch="tool-request/c3")
+    forge.add("issue", _body("c4"), labels=[LABEL, ANSWERED], state="closed", closed_at=_ago(1))
+    forge.add("issue", _body("c5"), state="closed", closed_at=_ago(40))
+    forge.add("issue", _body("c6"))
+
+    env = dict(_ci(kind, api, tmp_path), TOOLS_FILE="tools.yaml")
+    calls = _run(tmp_path, [], env, gitlab_ci=kind == "gitlab", installed=["c2"])
+
+    assert [args[2] for args in calls if args[0] == "installed"] == ["c1", "c2", "c3"]
+    assert _replies(calls) == {"c1": (rejected["url"], "closed"), "c2": (merged["url"], "installed")}
+    answered = [i["body"].split("`")[1] for i in forge.items if ANSWERED in i["labels"]]
+    assert sorted(answered) == ["c1", "c2", "c4"]
 
 
 def test_script_opens_only_issues_without_a_tool_list(tmp_path, forge_server):
@@ -253,9 +363,11 @@ def test_script_opens_only_issues_without_a_tool_list(tmp_path, forge_server):
     bwa = {"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}
 
     env = {"FORGE": "github", "FORGE_API": api, "FORGE_PROJECT": "org/tools", "EMIT_OPTIONS": "-l 'Other Tools'"}
-    replies, seen, calls = _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
+    calls = _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
 
-    assert calls[0] == ["emit", "-l", "Other Tools"]
-    assert forge.changes == []
-    assert replies["n1"] == forge.issues[0]["url"]
-    assert seen == ["n1"]
+    [emit] = [args for args in calls if args[0] == "emit"]
+    assert emit[-2:] == ["-l", "Other Tools"]
+    # No issue or pull request yet, so only unseen requests count.
+    assert "--seen-since" not in emit
+    assert [i["kind"] for i in forge.items] == ["issue"]
+    assert _replies(calls)["n1"] == (forge.items[0]["url"], "handling")

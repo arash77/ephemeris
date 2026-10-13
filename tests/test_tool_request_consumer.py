@@ -20,6 +20,7 @@ from ephemeris.tool_request_consumer import (
     emit,
     emit_item,
     fetch_notifications,
+    installed,
     main,
     MAX_BODY_LENGTH,
     merge_tool_list,
@@ -43,6 +44,14 @@ def _request(notification_id, tools=None, **fields):
 
 def _emit(notification_id, tools=None, shed=SHED):
     return emit_item(_request(notification_id, tools), shed, LABEL)
+
+
+def _galaxy_get(url, params=None):
+    """Answer like Galaxy's notifications API, which no longer has requests it expired."""
+    notification = next((n for n in NOTIFICATIONS if url.endswith(n["id"])), None)
+    return SimpleNamespace(
+        status_code=200 if notification else 404, json=lambda: notification, raise_for_status=lambda: None
+    )
 
 
 def _outside_code(markdown):
@@ -258,6 +267,19 @@ def test_emit_links_tools_no_repository_is_named_like(fake_tool_shed):
     assert "Request a wrapper" not in listed["body"]
 
 
+def test_emit_pins_tools_without_a_version_to_the_newest_revision(fake_tool_shed):
+    fake_tool_shed()
+    by_name = emit_item(_request("b2486a20bc56b90f", [{"name": "fastp"}]), FAKE_SHED, LABEL, pin_latest=True)
+    assert by_name["action"] == "pr"
+    assert by_name["tools"][0]["revisions"] == ["68386e630362"]
+    # The tools of a repository can have different versions, so only a named tool's version goes in the title.
+    assert by_name["title"] == "Install fastp"
+
+    workflow_tool = {"name": "fastp", "tool_shed_id": "fake-toolshed.test/repos/iuc/fastp"}
+    by_id = emit_item(_request("0aab0e4c25198ad8", [workflow_tool]), FAKE_SHED, LABEL, pin_latest=True)
+    assert by_id["title"] == "Install fastp 1.3.6+galaxy0"
+
+
 def test_emit_gives_unpinned_tools_their_own_entry(fake_tool_shed):
     fake_tool_shed()
     item = _emit(
@@ -357,6 +379,19 @@ def test_select_requests_skips_seen_deleted_and_other_categories():
 
     assert [n["id"] for n in select_requests(NOTIFICATIONS + [seen, deleted, message])] == unseen_ids
     assert [n["id"] for n in select_requests([seen], include_seen=True)] == ["a1"]
+
+
+def test_select_requests_picks_up_requests_an_admin_read():
+    read = dict(NOTIFICATIONS[0], id="r1", seen_time="2026-10-09T13:00:00", publication_time="2026-10-09T12:00:00")
+    handled = dict(read, id="r2")
+    # Sent before the first issue or pull request, so presumably handled by hand.
+    older = dict(read, id="r3", publication_time="2026-09-01T00:00:00")
+    # Handled, but its requester may not have been told yet.
+    unseen = dict(NOTIFICATIONS[0], id="r4")
+    since = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    picked = select_requests([read, handled, older, unseen], handled={"r2", "r4"}, seen_since=since)
+    assert [n["id"] for n in picked] == ["r1", "r4"]
 
 
 def test_fetch_notifications_reads_all_at_once():
@@ -511,9 +546,7 @@ def test_reply_notifies_the_exact_requester():
     gi = SimpleNamespace(
         url="http://galaxy.test/api",
         users=SimpleNamespace(get_users=lambda f_email: [u for u in users if f_email in u["email"]]),
-        make_get_request=lambda url, params=None: SimpleNamespace(
-            json=lambda: next(n for n in NOTIFICATIONS if url.endswith(n["id"])), raise_for_status=lambda: None
-        ),
+        make_get_request=_galaxy_get,
         make_post_request=post,
     )
 
@@ -536,6 +569,61 @@ def test_reply_notifies_the_exact_requester():
     assert not reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
 
 
+def test_reply_tells_how_the_request_ended():
+    posted = []
+
+    def post(url, payload):
+        posted.append(payload["notification"]["content"])
+        return {"total_notifications_sent": 1, "notification": {}}
+
+    gi = SimpleNamespace(
+        url="http://galaxy.test/api",
+        users=SimpleNamespace(get_users=lambda f_email: [{"id": "u2", "email": f_email}]),
+        make_get_request=_galaxy_get,
+        make_post_request=post,
+    )
+
+    # Admins without a tool list repository have no link to give.
+    assert reply(gi, "b2486a20bc56b90f", state="installed")
+    assert posted[-1]["subject"] == "Your requested tools are installed"
+    assert "http" not in posted[-1]["message"]
+    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/issues/8", state="closed")
+    assert posted[-1]["message"].endswith(": https://github.com/org/tools/issues/8")
+    # Galaxy deletes requests some months after they were sent.
+    assert not reply(gi, "0000000000000000", state="closed")
+    assert len(posted) == 2
+
+
+def test_installed_checks_galaxys_repositories(fake_tool_shed):
+    fake_tool_shed()
+
+    def galaxy(**changes):
+        repository = {
+            "status": "Installed",
+            "deleted": False,
+            "tool_shed": "fake-toolshed.test",
+            "owner": "iuc",
+            "name": "fastp",
+            "changeset_revision": "68386e630362",
+            "installed_changeset_revision": "68386e630362",
+        }
+        return SimpleNamespace(toolshed=SimpleNamespace(get_repositories=lambda: [dict(repository, **changes)]))
+
+    pinned = _request("b2486a20bc56b90f", [{"name": "fastp", "requested_version": "1.3.6+galaxy0"}])
+    unpinned = _request("b2486a20bc56b90f", [{"name": "fastp"}])
+    older = {"changeset_revision": "36be11c58dac", "installed_changeset_revision": "36be11c58dac"}
+
+    assert installed(galaxy(), pinned, FAKE_SHED)
+    # Updated since, the installed revision still counts.
+    assert installed(galaxy(changeset_revision="4990e6f1348f"), pinned, FAKE_SHED)
+    assert not installed(galaxy(**older), pinned, FAKE_SHED)
+    assert installed(galaxy(**older), unpinned, FAKE_SHED)
+    assert not installed(galaxy(status="Error"), pinned, FAKE_SHED)
+    assert not installed(galaxy(tool_shed="testtoolshed.g2.bx.psu.edu"), pinned, FAKE_SHED)
+    # A tool the Tool Shed does not have cannot be checked.
+    assert not installed(galaxy(), _request("b2486a20bc56b90f", [{"name": "Foldseek"}]), FAKE_SHED)
+
+
 def test_reply_waits_for_galaxy_to_send_it_in_a_task():
     # With Celery, Galaxy answers with a task, and sends the notification in it.
     states = {"t1": ["PENDING", "SUCCESS"], "t2": ["STARTED", "FAILURE"]}
@@ -545,9 +633,7 @@ def test_reply_waits_for_galaxy_to_send_it_in_a_task():
         if "/tasks/" in url:
             state = states[url.split("/")[-2]].pop(0)
             return SimpleNamespace(json=lambda: state, raise_for_status=lambda: None)
-        return SimpleNamespace(
-            json=lambda: next(n for n in NOTIFICATIONS if url.endswith(n["id"])), raise_for_status=lambda: None
-        )
+        return _galaxy_get(url)
 
     gi = SimpleNamespace(
         url="http://galaxy.test/api",

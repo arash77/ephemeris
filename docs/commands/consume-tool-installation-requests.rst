@@ -65,18 +65,27 @@ On GitLab:
   ``FORGE_TOKEN`` variable, since the CI job token cannot push branches,
 - create a pipeline schedule, for example every hour.
 
-``emit`` only picks up requests that are not marked as seen. Use an admin
-account that nobody reads notifications with, since marking them as read in
-Galaxy hides them from the script.
+The script labels the issues and pull requests it opens with ``REQUEST_LABEL``
+and tells the requester where their request is handled. It finds the issues
+and pull requests of earlier runs by that label, so a run that stops halfway,
+for example because Galaxy limits how many notifications an account may send
+per minute (``send_notification_rate_limit``), is picked up by the next one
+without opening duplicates. A pull request item whose tools are in the
+repository already becomes an issue instead.
 
-A request is marked as seen once its requester got an answer, or cannot get
-one because their account is gone or they turned off message notifications.
-If a run stops halfway, for example because Galaxy limits how many
-notifications an account may send per minute (``send_notification_rate_limit``),
-the next run answers the remaining requests and reuses the issues and pull
-requests already opened. It finds pull requests by their branch, and issues by
-the ``ISSUE_LABEL`` label and the first line of their body. A pull request item
-whose tools are in the repository already becomes an issue instead.
+Admins can read and mark requests in Galaxy as they like. ``emit`` picks up
+unseen requests, and also requests marked as seen that arrived after the
+script's first issue or pull request and have none yet. So the script can use
+the account of the only admin of a small Galaxy, and on its first run it leaves
+alone the requests that admins read before.
+
+Once an issue or pull request is closed, the script asks Galaxy whether the
+requested tools are installed now, and tells the requester that they are, or
+that the request was closed without installing them. It then adds
+``ANSWERED_LABEL``. It waits for the tools of a merged pull request to be
+installed, by an install job like the one below or by hand, and gives up on
+those closed more than 30 days ago. Only tools found on the Tool Shed can be
+checked, so a request with others is told that it was closed.
 
 Request pull requests all start from the same base branch, so merging one can
 make others conflict, like any pull requests that change the same lines. An
@@ -106,7 +115,8 @@ for the next run; after a day, they become issues anyway.
 
 Issue and pull request bodies show what users typed into the request form as
 code, so that it cannot mention people. They do not contain the requester's
-email address.
+email address, but what users typed is public in a public repository, so use a
+private one if your users' requests should stay private.
 
 .. literalinclude:: ../examples/tool-installation-requests.sh
    :language: bash
@@ -116,7 +126,41 @@ The GitHub Actions workflow:
 .. literalinclude:: ../examples/tool-installation-requests.yml
    :language: yaml
 
-The GitLab CI job:
+The GitLab CI jobs, with the install job described below:
 
 .. literalinclude:: ../examples/tool-installation-requests.gitlab-ci.yml
+   :language: yaml
+
+Small and private Galaxy servers
+--------------------------------
+
+Most Galaxy servers have no bot that keeps their tools up to date and installs
+them. For those:
+
+- ``EMIT_OPTIONS=--pin-latest`` pins tools requested without a version to their
+  newest installable revision, so that such requests become pull requests too,
+  for an admin to review.
+- The install job below installs the tool list whenever it changes on the
+  default branch, for example when a request's pull request is merged. The
+  next run of the script then tells the requester that the tools are installed.
+- GitHub's and GitLab's own machines cannot reach a Galaxy server on a private
+  network. Run the jobs on a self-hosted runner there instead, or run the script
+  from cron on a machine that can reach both Galaxy and the forge, in a
+  checkout it resets before each run::
+
+    23 * * * * cd /srv/tools && git fetch -q && git reset -q --hard origin/main && git clean -qfd && FORGE=github FORGE_PROJECT=org/tools EPHEMERIS_GALAXY=https://galaxy.example.org EPHEMERIS_API_KEY=... FORGE_TOKEN=... TOOLS_FILE=requested_tools.yaml EMIT_OPTIONS=--pin-latest bash tool-installation-requests.sh
+
+Without a tool list repository, an admin can handle requests by hand: write
+the pull request items to a tool list, review it, install it, and tell the
+requesters::
+
+    consume-tool-installation-requests emit --pin-latest > requests.json
+    jq '[.[] | select(.action == "pr")]' requests.json | consume-tool-installation-requests render-yaml -o requested_tools.yaml
+    shed-tools install --tools-file requested_tools.yaml
+    consume-tool-installation-requests reply --notification-id ID --state installed
+    consume-tool-installation-requests mark-seen ID
+
+The install job for GitHub Actions, which the GitLab example above has too:
+
+.. literalinclude:: ../examples/install-requested-tools.yml
    :language: yaml

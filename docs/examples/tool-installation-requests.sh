@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Opens an issue or a pull request in this repository for each new tool
-# installation request on a Galaxy server, then tells the requester where it is
-# handled. Run it on a schedule, from any CI system or cron, in a clean checkout
-# of the repository. See the consume-tool-installation-requests page of the
-# ephemeris docs.
+# installation request on a Galaxy server, and tells the requester where it is
+# handled. Once the issue or pull request is closed, it tells them whether the
+# tools got installed. Run it on a schedule, from any CI system or cron, in a
+# clean checkout of the repository, on a machine that can reach Galaxy. See the
+# consume-tool-installation-requests page of the ephemeris docs.
 #
 # It needs bash, git, curl, jq and ephemeris, and reads these variables:
 #
@@ -22,9 +23,13 @@
 # APPLY_COMMAND      Shell command that adds the tools of the work item in the file
 #                    $ITEM to the checkout, for repositories that are not a single
 #                    tool list. Defaults to render-yaml into TOOLS_FILE.
-# ISSUE_LABEL        Label of the issues opened here (default: tool installation request).
-# EMIT_OPTIONS       Options for emit, written as in a shell, for example
-#                    --tool-shed-url https://toolshed.example.org/ --panel-label 'Other Tools'.
+# TOOL_SHED_URL      Tool Shed to look requested tools up on (default: the main one).
+# EMIT_OPTIONS       More options for emit, written as in a shell, for example
+#                    --panel-label 'Other Tools' --pin-latest.
+# REQUEST_LABEL      Label of the issues and pull requests opened here
+#                    (default: tool installation request).
+# ANSWERED_LABEL     Label added once the requester got told how their request
+#                    ended (default: tool installation request answered).
 #
 # Without TOOLS_FILE or APPLY_COMMAND, every request becomes an issue.
 set -euo pipefail
@@ -65,12 +70,16 @@ esac
 : "${FORGE_TOKEN:?}" "${FORGE_API:?}" "${FORGE_PROJECT:?}"
 BASE_BRANCH=${BASE_BRANCH:-${CI_COMMIT_BRANCH:-$(git branch --show-current)}}
 : "${BASE_BRANCH:?Set BASE_BRANCH to the branch that pull requests go to}"
-ISSUE_LABEL=${ISSUE_LABEL:-tool installation request}
+REQUEST_LABEL=${REQUEST_LABEL:-tool installation request}
+ANSWERED_LABEL=${ANSWERED_LABEL:-tool installation request answered}
 if [ -z "${APPLY_COMMAND:-}" ] && [ -n "${TOOLS_FILE:-}" ]; then
     # shellcheck disable=SC2016 # expanded when the command runs
     APPLY_COMMAND='jq -s . "$ITEM" | consume-tool-installation-requests render-yaml --tools-file "$TOOLS_FILE" -o "$TOOLS_FILE"'
 fi
 export FORGE_TOKEN TOOLS_FILE
+shed_options=(${TOOL_SHED_URL:+--tool-shed-url "$TOOL_SHED_URL"})
+emit_options=()
+eval "emit_options=(${EMIT_OPTIONS:-})"
 
 # Pull requests commit every change that APPLY_COMMAND makes.
 if [ -n "$(git status --porcelain)" ]; then
@@ -81,6 +90,7 @@ base=$(git rev-parse HEAD)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+requests() { consume-tool-installation-requests "$@"; }
 uri() { jq -rn --arg value "$1" '$value | @uri'; }
 
 headers() {
@@ -105,31 +115,72 @@ api() {
     cat "$work/response.json"
 }
 
+# list PATH FILTER adds what jq's FILTER makes of every page of PATH to artifacts.jsonl.
+list() {
+    local page
+    for ((page = 1; ; page++)); do
+        api GET "$1&per_page=100&page=$page" > "$work/page.json"
+        [ "$(jq length "$work/page.json")" -gt 0 ] || break
+        jq -c ".[] | $2" "$work/page.json" >> "$work/artifacts.jsonl"
+    done
+}
+
+# Turns an issue or pull request into {url, number, kind, state, labels, created_at, closed_at, id}.
+# shellcheck disable=SC2016 # a jq expression
+artifact='{url, number, kind, state, labels, created_at, closed_at,
+    id: ((.body // "" | split("\n")[0] | capture("notification `(?<id>[^`]+)`") | .id) // null)}'
+
 if [ "$FORGE" = github ]; then
     project="repos/$FORGE_PROJECT"
     label_color=ededed
-    issue_fields='.[] | select(has("pull_request") | not) | {url: .html_url, body: (.body // "")}'
+
+    # Lists the issues and pull requests that have the label, which GitHub returns together.
+    list_artifacts() {
+        list "/issues?state=all&labels=$(uri "$REQUEST_LABEL")" "{
+            url: .html_url, number, body, created_at, labels: [.labels[].name],
+            kind: (if .pull_request then \"change\" else \"issue\" end),
+            state: (if .pull_request.merged_at then \"merged\" elif .state == \"closed\" then \"closed\" else \"open\" end),
+            closed_at: (.pull_request.merged_at // .closed_at)} | $artifact"
+    }
 
     # Prints the URL of a pull request from this repository's branch $1, open or not.
     find_change() {
         api GET "/pulls?state=all&head=$(uri "${FORGE_PROJECT%%/*}:$1")" | jq -r '.[0].html_url // empty'
     }
 
+    # add_label KIND NUMBER LABEL
+    add_label() {
+        jq -n --arg label "$3" '{labels: [$label]}' > "$work/label-payload.json"
+        api POST "/issues/$2/labels" "$work/label-payload.json" > /dev/null
+    }
+
     open_change() {
         jq -n --arg head "$1" --arg base "$BASE_BRANCH" --arg title "$2" --rawfile body "$work/body.md" \
             '{$head, $base, $title, $body}' > "$work/payload.json"
-        api POST /pulls "$work/payload.json" | jq -r .html_url
+        api POST /pulls "$work/payload.json" > "$work/change.json" || return 1
+        add_label change "$(jq -r .number "$work/change.json")" "$REQUEST_LABEL" || return 1
+        jq -r .html_url "$work/change.json"
     }
 
     open_issue() {
-        jq -n --arg title "$1" --rawfile body "$work/body.md" --arg label "$ISSUE_LABEL" \
+        jq -n --arg title "$1" --rawfile body "$work/body.md" --arg label "$REQUEST_LABEL" \
             '{$title, $body, labels: [$label]}' > "$work/payload.json"
         api POST /issues "$work/payload.json" | jq -r .html_url
     }
 else
     project="projects/$(uri "$FORGE_PROJECT")"
     label_color='#ededed'
-    issue_fields='.[] | {url: .web_url, body: (.description // "")}'
+
+    list_artifacts() {
+        list "/issues?state=all&labels=$(uri "$REQUEST_LABEL")" "{
+            url: .web_url, number: .iid, body: .description, created_at, closed_at, labels, kind: \"issue\",
+            state: (if .state == \"closed\" then \"closed\" else \"open\" end)} | $artifact"
+        list "/merge_requests?state=all&labels=$(uri "$REQUEST_LABEL")" "
+            select(.source_project_id == .target_project_id) | {
+            url: .web_url, number: .iid, body: .description, created_at, labels, kind: \"change\",
+            state: (if .state == \"merged\" or .state == \"closed\" then .state else \"open\" end),
+            closed_at: (.merged_at // .closed_at)} | $artifact"
+    }
 
     # Prints the URL of a merge request from this project's branch $1, open or not.
     find_change() {
@@ -137,15 +188,23 @@ else
             jq -r 'map(select(.source_project_id == .target_project_id))[0].web_url // empty'
     }
 
+    add_label() {
+        local path=issues
+        [ "$1" = change ] && path=merge_requests
+        jq -n --arg labels "$3" '{add_labels: $labels}' > "$work/label-payload.json"
+        api PUT "/$path/$2" "$work/label-payload.json" > /dev/null
+    }
+
     open_change() {
         jq -n --arg source_branch "$1" --arg target_branch "$BASE_BRANCH" --arg title "$2" \
-            --rawfile description "$work/body.md" \
-            '{$source_branch, $target_branch, $title, $description, remove_source_branch: true}' > "$work/payload.json"
+            --rawfile description "$work/body.md" --arg labels "$REQUEST_LABEL" \
+            '{$source_branch, $target_branch, $title, $description, $labels, remove_source_branch: true}' \
+            > "$work/payload.json"
         api POST /merge_requests "$work/payload.json" | jq -r .web_url
     }
 
     open_issue() {
-        jq -n --arg title "$1" --rawfile description "$work/body.md" --arg labels "$ISSUE_LABEL" \
+        jq -n --arg title "$1" --rawfile description "$work/body.md" --arg labels "$REQUEST_LABEL" \
             '{$title, $description, $labels}' > "$work/payload.json"
         api POST /issues "$work/payload.json" | jq -r .web_url
     }
@@ -158,6 +217,7 @@ push() {
         push --quiet --force "$PUSH_URL" "HEAD:refs/heads/$1"
 }
 
+# Opens an issue or a pull request for the work item, unless an earlier run did, and tells the requester.
 handle() {
     local id action title branch url
     jq -r .body "$work/item.json" > "$work/body.md"
@@ -166,11 +226,9 @@ handle() {
     title=$(jq -r .title "$work/item.json")
     branch="tool-request/$id"
     # Reuse what an earlier run opened, also if the request turned from an issue into a pull request since.
-    url=$(find_change "$branch") || return 1
+    url=$(jq -rn --arg id "$id" 'first(inputs | select(.id == $id) | .url) // empty' "$work/artifacts.jsonl")
     if [ -z "$url" ]; then
-        # The first line of the body names the request.
-        url=$(jq -rn --arg first "$(head -n 1 "$work/body.md")" \
-            'first(inputs | select(.body | startswith($first)) | .url) // empty' "$work/issues.jsonl")
+        url=$(find_change "$branch") || return 1
     fi
     if [ -z "$url" ] && [ "$action" = pr ] && [ -n "${APPLY_COMMAND:-}" ]; then
         git switch --quiet -C "$branch" "$base" || return 1
@@ -188,24 +246,46 @@ handle() {
     if [ -z "$url" ]; then
         url=$(open_issue "$title") || return 1
     fi
-    consume-tool-installation-requests reply --notification-id "$id" --url "$url" &&
-        consume-tool-installation-requests mark-seen "$id"
+    requests reply --notification-id "$id" --url "$url" && requests mark-seen "$id"
 }
 
-# Make sure the label exists. Creating one that exists fails harmlessly.
-jq -n --arg name "$ISSUE_LABEL" --arg color "$label_color" '{$name, $color}' > "$work/label.json"
-api POST /labels "$work/label.json" > /dev/null 2>&1 || true
+# Tells the requester whether the tools of a closed issue or pull request got installed.
+tell_outcome() {
+    local id url number kind state answer
+    id=$(jq -r .id "$work/artifact.json")
+    url=$(jq -r .url "$work/artifact.json")
+    number=$(jq -r .number "$work/artifact.json")
+    kind=$(jq -r .kind "$work/artifact.json")
+    state=$(jq -r .state "$work/artifact.json")
+    answer=$(requests installed --notification-id "$id" "${shed_options[@]}") || return 1
+    if [ "$answer" = yes ]; then
+        state=installed
+    elif [ "$state" = merged ]; then
+        # Wait for the tools to be installed.
+        return 0
+    else
+        state=closed
+    fi
+    requests reply --notification-id "$id" --url "$url" --state "$state" &&
+        add_label "$kind" "$number" "$ANSWERED_LABEL"
+}
 
-# Listing issues by label, unlike searching them, sees issues opened moments ago.
-: > "$work/issues.jsonl"
-for ((page = 1; ; page++)); do
-    api GET "/issues?state=all&per_page=100&page=$page&labels=$(uri "$ISSUE_LABEL")" > "$work/page.json"
-    [ "$(jq length "$work/page.json")" -gt 0 ] || break
-    jq -c "$issue_fields" "$work/page.json" >> "$work/issues.jsonl"
+# Make sure the labels exist. Creating one that exists fails harmlessly.
+for label in "$REQUEST_LABEL" "$ANSWERED_LABEL"; do
+    jq -n --arg name "$label" --arg color "$label_color" '{$name, $color}' > "$work/label.json"
+    api POST /labels "$work/label.json" > /dev/null 2>&1 || true
 done
 
-eval "consume-tool-installation-requests emit ${EMIT_OPTIONS:-}" > "$work/requests.json"
+# Listing by label, unlike searching, sees what was opened moments ago.
+: > "$work/artifacts.jsonl"
+list_artifacts
+jq -r 'select(.id) | .id' "$work/artifacts.jsonl" > "$work/handled.txt"
+# Requests sent since the first issue or pull request are handled here even if an admin read them in Galaxy.
+since=$(jq -rn '[inputs | .created_at] | min // empty' "$work/artifacts.jsonl")
+
 failed=0
+requests emit --handled "$work/handled.txt" ${since:+--seen-since "$since"} "${shed_options[@]}" \
+    "${emit_options[@]}" > "$work/requests.json"
 for i in $(seq 0 $(($(jq length "$work/requests.json") - 1))); do
     jq ".[$i]" "$work/requests.json" > "$work/item.json"
     if ! handle; then
@@ -215,4 +295,17 @@ for i in $(seq 0 $(($(jq length "$work/requests.json") - 1))); do
     git switch --quiet --discard-changes --detach "$base"
     git clean --quiet --force -d
 done
+
+# Look at what was closed in the last 30 days, so that pull requests whose tools never get installed
+# are not looked up forever.
+jq -c --arg answered "$ANSWERED_LABEL" --arg since "$(jq -rn 'now - 30 * 86400 | todate')" '
+    select(.id and .state != "open" and (.closed_at // "") >= $since and (.labels | index($answered) | not))' \
+    "$work/artifacts.jsonl" > "$work/closed.jsonl"
+while read -r line <&3; do
+    printf '%s\n' "$line" > "$work/artifact.json"
+    if ! tell_outcome; then
+        echo "Could not tell the requester about $(jq -r .url "$work/artifact.json"), the next run tries again" >&2
+        failed=1
+    fi
+done 3< "$work/closed.jsonl"
 exit "$failed"

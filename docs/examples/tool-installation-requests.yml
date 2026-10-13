@@ -1,6 +1,7 @@
 # Opens an issue or a pull request in this repository for each new tool
-# installation request on a Galaxy server, then tells the requester where it is
-# handled. Needs tool-installation-requests.sh from the ephemeris docs in .github/.
+# installation request on a Galaxy server, tells the requester where it is
+# handled, and later whether the tools got installed. Needs
+# tool-installation-requests.sh from the ephemeris docs in .github/.
 # See the consume-tool-installation-requests page of the ephemeris docs.
 name: Tool installation requests
 
@@ -27,6 +28,8 @@ jobs:
       EPHEMERIS_GALAXY: https://galaxy.example.org
       # Leave TOOLS_FILE out to open only issues, or set APPLY_COMMAND for other repository layouts.
       TOOLS_FILE: requested_tools.yaml
+      # Without a bot that updates your tools, --pin-latest makes requests without a version pull requests too.
+      EMIT_OPTIONS: --pin-latest
     steps:
       - uses: actions/checkout@v7.0.1
         with:
