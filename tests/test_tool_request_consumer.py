@@ -390,7 +390,10 @@ def test_select_requests_picks_up_requests_an_admin_read():
     unseen = dict(NOTIFICATIONS[0], id="r4")
     since = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
-    picked = select_requests([read, handled, older, unseen], handled={"r2", "r4"}, seen_since=since)
+    # Seen moments ago, maybe by the run that handled it, whose issue the forge does not list yet.
+    just_read = dict(read, id="r5", seen_time=datetime.now(timezone.utc).isoformat())
+
+    picked = select_requests([read, handled, older, unseen, just_read], handled={"r2", "r4"}, seen_since=since)
     assert [n["id"] for n in picked] == ["r1", "r4"]
 
 

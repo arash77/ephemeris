@@ -75,6 +75,8 @@ TOOL_SHED_TIMEOUT = 60
 # How long a request waits for the Tool Shed to answer before it becomes an issue anyway.
 TOOL_SHED_PATIENCE = timedelta(days=1)
 TOOL_SHED_ERRORS = (BioblendError, OSError, ValueError)
+# GitHub and GitLab list new issues with a delay, so a request handled moments ago looks unhandled until then.
+LISTING_DELAY = timedelta(minutes=5)
 # Seconds to wait for a Galaxy that sends notifications in a Celery task.
 REPLY_TIMEOUT = 60
 # How a tool list that render-yaml starts installs its tools.
@@ -133,7 +135,9 @@ def select_requests(
     """Keep the tool installation requests in an admin's notifications that need handling.
 
     Those are the unseen requests, and, from ``seen_since`` on, seen ones that are not in
-    ``handled``, since an admin may read a request in Galaxy before it is handled.
+    ``handled``, since an admin may read a request in Galaxy before it is handled. Those
+    must have been seen for ``LISTING_DELAY``, since the forge may not list the issue or
+    pull request of a request handled moments ago yet.
     Submitters get their confirmation copy in their own inbox, so an admin's inbox
     only holds the requests themselves.
     """
@@ -147,6 +151,7 @@ def select_requests(
             seen_since is not None
             and n["id"] not in (handled or set())
             and _parse_time(n["publication_time"]) >= seen_since
+            and _parse_time(n["seen_time"]) <= datetime.now(timezone.utc) - LISTING_DELAY
         )
 
     return [n for n in notifications if wanted(n)]

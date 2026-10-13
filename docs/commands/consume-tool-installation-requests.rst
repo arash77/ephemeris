@@ -87,7 +87,9 @@ script skip a request, delete it there.
 
 Admins can read and mark requests in Galaxy as they like. ``emit`` picks up
 unseen requests, and also requests marked as seen that arrived after the
-script's first issue or pull request and have none yet. So the script can use
+script's first issue or pull request and have none yet. Those wait until they
+have been seen for five minutes, since GitHub and GitLab list new issues with a
+delay, so a run right after another could otherwise handle a request twice. So the script can use
 the account of the only admin of a small Galaxy, and on its first run it leaves
 alone the requests that admins read before. It does mark the requests it
 handled as seen, though, and GitHub and GitLab do not tell you about issues
