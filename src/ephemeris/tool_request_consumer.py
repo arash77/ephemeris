@@ -35,6 +35,7 @@ from datetime import (
     timezone,
 )
 from functools import cache
+from urllib.parse import quote
 
 import yaml
 from bioblend import ConnectionError as BioblendError
@@ -63,6 +64,8 @@ MAX_BODY_LENGTH = 65536
 # Longest user text shown in table cells and headings.
 MAX_INLINE_LENGTH = 300
 TRUNCATED = "(Truncated, the full request is in Galaxy.)"
+# Longest user text put into a wrapper request link, which browsers and forges limit in length.
+MAX_LINK_TEXT_LENGTH = 500
 DEFAULT_TOOL_SHED = "https://toolshed.g2.bx.psu.edu/"
 DEFAULT_PANEL_LABEL = "Tools from user request"
 # Seconds to wait for each Tool Shed response.
@@ -79,7 +82,10 @@ log = logging.getLogger(__name__)
 
 
 class Unresolved(Exception):
-    pass
+    def __init__(self, message: str, not_on_tool_shed: bool = False):
+        super().__init__(message)
+        # No repository is named like the tool, so it may not be wrapped yet.
+        self.not_on_tool_shed = not_on_tool_shed
 
 
 class ReplyFailed(Exception):
@@ -139,11 +145,15 @@ def _find_repository(shed_url: str, name: str | None) -> dict:
     """Find the repository named exactly like a free-text tool name."""
     if not name:
         raise Unresolved("no tool name to look the repository up by")
-    # An exact lookup is fast whatever users type, unlike the Tool Shed's full-text search.
-    key = name.strip().lower()
-    matches = _repositories(shed_url, key) if REPOSITORY_NAME.fullmatch(key) else []
+    # An exact lookup is fast whatever users type, unlike the Tool Shed's full-text search. Repository
+    # names only hold lower case letters, digits and underscores, so try the name in that form too.
+    typed = name.strip().lower()
+    keys = [
+        k for k in dict.fromkeys([typed, re.sub(r"[^a-z0-9]+", "_", typed).strip("_")]) if REPOSITORY_NAME.fullmatch(k)
+    ]
+    matches = next((found for found in (_repositories(shed_url, key) for key in keys) if found), [])
     if not matches:
-        raise Unresolved(f"no repository named {name} on {shed_url}")
+        raise Unresolved(f"no repository named {name} on {shed_url}", not_on_tool_shed=True)
     if len(matches) > 1:
         raise Unresolved(
             "several repositories match: " + ", ".join(sorted(f"{r['owner']}/{r['name']}" for r in matches))
@@ -211,6 +221,35 @@ def _code_block(text: str) -> str:
     return f"{fence}\n{text.rstrip()}\n{fence}"
 
 
+def _wrapper_request_link(template: str, tool: dict) -> str:
+    """Fill a URL template, such as a new issue's, with what the user said about a tool."""
+    name, url, description, domain = (
+        (tool.get(key) or "")[:MAX_LINK_TEXT_LENGTH] for key in ("name", "tool_url", "description", "scientific_domain")
+    )
+    body = "\n\n".join(
+        filter(
+            None,
+            [
+                description,
+                url and f"Homepage: {url}",
+                domain and f"Scientific domain: {domain}",
+                "A Galaxy user asked for this tool in a tool installation request.",
+            ],
+        )
+    )
+    values = {
+        "name": name,
+        "url": url,
+        "description": description,
+        "domain": domain,
+        "title": f"Tool request: {name}",
+        "body": body,
+    }
+    for key, value in values.items():
+        template = template.replace(f"{{{key}}}", quote(value, safe=""))
+    return template
+
+
 def _size(lines: list[str]) -> int:
     """Return how much joining ``lines`` onto a body with newlines adds to it."""
     return sum(len(line) + 1 for line in lines)
@@ -222,16 +261,20 @@ def emit_item(
     panel_label: str,
     label_map: dict | None = None,
     tool_shed_error: Exception | None = None,
+    wrapper_request_url: str | None = None,
 ) -> dict:
     """Turn a request into a work item.
 
     Tool Shed failures propagate, so that the request can be tried again later,
     unless ``tool_shed_error`` is given: then no tool is looked up, and the
-    request becomes an issue that shows the error.
+    request becomes an issue that shows the error. For tools that no Tool Shed
+    repository is named like, the issue links to ``wrapper_request_url`` filled
+    in by :func:`_wrapper_request_link`.
     """
     content = notification["content"]
     entries: dict[tuple[str, str, bool], dict] = {}
     rows = []
+    wrapper_links = []
     confirmed_labels = []
     failed = False
     for tool in content["tools"]:
@@ -242,6 +285,9 @@ def emit_item(
         except Unresolved as e:
             failed = True
             rows.append(f"| {_code(_label(tool))} | not resolved: {_code(str(e))} | |")
+            if wrapper_request_url and e.not_on_tool_shed:
+                link = _wrapper_request_link(wrapper_request_url, tool)
+                wrapper_links.append(f"- [Request a wrapper for {_code(tool['name'])}]({link})")
             continue
         # A tool without a version follows the latest revision, so it needs an entry without revisions.
         entry = entries.setdefault(
@@ -293,18 +339,32 @@ def emit_item(
     if content.get("additional_remarks"):
         free_text.append(("Remarks:", content["additional_remarks"]))
 
-    # Free text gets what is left of GitHub's limit, and is cut inside its code block so that it stays code.
+    # Wrapper links, then free text, get what is left of GitHub's limit. Free text is cut inside its
+    # code block, so that it stays code.
     room = MAX_BODY_LENGTH - _size(body) + 1 - _size(tool_list) - _size(["", TRUNCATED])
-    for heading, text in free_text:
+    truncated = False
+    if wrapper_links:
+        section = ["", "The Tool Shed has no repository named like these tools. If they are not wrapped yet:"]
+        for link in wrapper_links:
+            if _size(section) + _size([link]) > room:
+                truncated = True
+                break
+            section.append(link)
+        if len(section) > 2:
+            body += section
+            room -= _size(section)
+    for heading, text in [] if truncated else free_text:
         block = ["", heading, _code_block(text)]
         if _size(block) > room:
             block[2] = _code_block(text[: max(0, len(text) - (_size(block) - room))])
             if _size(block) <= room:
                 body += block
-            body += ["", TRUNCATED]
+            truncated = True
             break
         body += block
         room -= _size(block)
+    if truncated:
+        body += ["", TRUNCATED]
     body += tool_list
     return {
         "notification_id": notification["id"],
@@ -327,7 +387,13 @@ def _status(error: Exception) -> int | None:
     return getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
 
 
-def emit(notifications: list[dict], tool_shed_url: str, panel_label: str, label_map: dict | None = None) -> list[dict]:
+def emit(
+    notifications: list[dict],
+    tool_shed_url: str,
+    panel_label: str,
+    label_map: dict | None = None,
+    wrapper_request_url: str | None = None,
+) -> list[dict]:
     """Turn requests into work items, leaving those that wait for the Tool Shed to a later run."""
     items = []
     # Set once the Tool Shed does not answer at all, so that the run stops waiting for it.
@@ -336,7 +402,7 @@ def emit(notifications: list[dict], tool_shed_url: str, panel_label: str, label_
         error = unreachable
         if error is None:
             try:
-                items.append(emit_item(notification, tool_shed_url, panel_label, label_map))
+                items.append(emit_item(notification, tool_shed_url, panel_label, label_map, None, wrapper_request_url))
                 continue
             except TOOL_SHED_ERRORS as e:
                 error = e
@@ -345,7 +411,7 @@ def emit(notifications: list[dict], tool_shed_url: str, panel_label: str, label_
         if _waited(notification) < TOOL_SHED_PATIENCE:
             log.warning(f"Skipping {notification['id']} until the Tool Shed answers: {error}")
             continue
-        items.append(emit_item(notification, tool_shed_url, panel_label, label_map, tool_shed_error=error))
+        items.append(emit_item(notification, tool_shed_url, panel_label, label_map, error, wrapper_request_url))
     return items
 
 
@@ -486,6 +552,12 @@ def _parser():
         dest="panel_label_json",
         help="JSON file or URL mapping 'owner/name' to a tool panel section label, overriding -l.",
     )
+    emit.add_argument(
+        "--wrapper-request-url",
+        help="URL that issues link to for tools no Tool Shed repository is named like, such as a new issue in "
+        "a tool development repository. {name}, {url}, {description}, {domain}, {title} and {body} in it "
+        "are replaced with what the user said about the tool.",
+    )
 
     # render-yaml needs no Galaxy.
     render = subparsers.add_parser(
@@ -548,7 +620,8 @@ def main(argv=None):
     if args.command == "emit":
         label_map = get_dictionary_from_json(args.panel_label_json) if args.panel_label_json else None
         pending = select_requests(fetch_notifications(gi), include_seen=args.include_seen)
-        items = emit(pending, format_tool_shed_url(args.tool_shed_url), args.panel_label, label_map)
+        shed_url = format_tool_shed_url(args.tool_shed_url)
+        items = emit(pending, shed_url, args.panel_label, label_map, args.wrapper_request_url)
         for item in items:
             log.info(f"{item['notification_id']}: {item['action']} {item['title']}")
         json.dump(items, sys.stdout, indent=2)

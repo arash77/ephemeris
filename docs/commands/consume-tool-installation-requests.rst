@@ -89,6 +89,16 @@ entry with neither ``revisions`` nor ``changeset_revision`` as following the
 latest revision, and leaves that repository alone. An entry pinned with
 ``changeset_revision`` that gains a revision gets a ``revisions`` list instead.
 
+Users may ask for tools that nobody has wrapped for Galaxy yet. With
+``--wrapper-request-url``, the issue for a tool that no Tool Shed repository is
+named like links to a prefilled request in a tool development repository, for
+an admin to check and send. ``{name}``, ``{url}``, ``{description}``,
+``{domain}``, ``{title}`` and ``{body}`` in the URL are replaced with what the
+user said about the tool. For example, set ``EMIT_OPTIONS`` to one of::
+
+    --wrapper-request-url 'https://github.com/galaxyproject/tools-iuc/issues/new?title={title}&body={body}&labels=tool%20request'
+    --wrapper-request-url 'https://github.com/bgruening/galaxytools/issues/new?template=tool-request.yml&title={title}&tool-name={name}&description={description}&links={url}'
+
 Tools are only looked up on the Tool Shed given to ``emit``. A workflow that needs tools from
 another Tool Shed leads to an issue, so that an admin decides whether to trust
 that Tool Shed. While that Tool Shed fails to answer, ``emit`` leaves requests

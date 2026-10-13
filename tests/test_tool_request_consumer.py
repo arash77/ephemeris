@@ -6,6 +6,10 @@ from datetime import (
     timezone,
 )
 from types import SimpleNamespace
+from urllib.parse import (
+    parse_qs,
+    urlsplit,
+)
 
 import pytest
 import yaml
@@ -47,7 +51,9 @@ def _outside_code(markdown):
 
 
 class FakeToolShed:
-    """A Tool Shed with only iuc/fastp, failing every lookup with ``error`` if given."""
+    """A Tool Shed with only iuc/fastp and devteam/samtools_sort, failing every lookup with ``error`` if given."""
+
+    OWNERS = {"fastp": "iuc", "samtools_sort": "devteam"}
 
     def __init__(self, error=None):
         self.url = FAKE_SHED + "api"
@@ -59,7 +65,9 @@ class FakeToolShed:
         self.requests.append((name, owner))
         if self.error:
             raise self.error
-        return [{"id": "f1", "owner": "iuc", "name": "fastp"}] if name == "fastp" and owner in (None, "iuc") else []
+        if name not in self.OWNERS or owner not in (None, self.OWNERS[name]):
+            return []
+        return [{"id": "f1" if name == "fastp" else "s1", "owner": self.OWNERS[name], "name": name}]
 
     def make_get_request(self, url, params=None):
         assert url == f"{self.url}/repositories/f1/metadata"
@@ -205,7 +213,7 @@ def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
         tools=[
             {"name": " FastP ", "requested_version": "1.3.6+galaxy0"},
             {"name": "fastp", "requested_version": "1.3.6+galaxy0"},
-            # No repository name has these characters, so this needs no lookup.
+            # Repository names only hold lower case letters, digits and underscores.
             {"name": "bowtie2: map"},
         ],
         shed=FAKE_SHED,
@@ -219,7 +227,35 @@ def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
             "revisions": ["68386e630362"],
         }
     ]
-    assert shed.requests == [("fastp", None)]
+    assert shed.requests == [("fastp", None), ("bowtie2_map", None)]
+
+
+def test_emit_links_tools_no_repository_is_named_like(fake_tool_shed):
+    shed = fake_tool_shed()
+    template = "https://github.com/org/tools-dev/issues/new?title={title}&body={body}&labels=tool%20request"
+    tools = [
+        # The Tool Shed spells this samtools_sort.
+        {"name": "Samtools sort"},
+        {"name": "NewTool @victim", "tool_url": "https://example.org/newtool", "description": "Does (new) things."},
+    ]
+    item = emit_item(_request("b2486a20bc56b90f", tools), FAKE_SHED, LABEL, wrapper_request_url=template)
+
+    assert ("samtools_sort", None) in shed.requests
+    [(name, link)] = re.findall(r"\[Request a wrapper for `([^`]*)`\]\((\S+)\)", item["body"])
+    assert name == "NewTool @victim"
+    query = parse_qs(urlsplit(link).query)
+    assert query["title"] == ["Tool request: NewTool @victim"]
+    assert "Does (new) things." in query["body"][0]
+    assert "Homepage: https://example.org/newtool" in query["body"][0]
+    assert query["labels"] == ["tool request"]
+    # The link names the tool as code and encodes what users typed.
+    assert "@victim" not in _outside_code(item["body"])
+
+    # Tools the Tool Shed has get no link.
+    listed = emit_item(
+        _request("b2486a20bc56b90f", [{"name": "fastp"}]), FAKE_SHED, LABEL, wrapper_request_url=template
+    )
+    assert "Request a wrapper" not in listed["body"]
 
 
 def test_emit_gives_unpinned_tools_their_own_entry(fake_tool_shed):

@@ -46,9 +46,16 @@ github)
 gitlab)
     FORGE_API=${FORGE_API:-${CI_API_V4_URL:-}}
     FORGE_PROJECT=${FORGE_PROJECT:-${CI_PROJECT_ID:-}}
-    PUSH_URL=${PUSH_URL:-${CI_SERVER_URL:+$CI_SERVER_URL/$CI_PROJECT_PATH.git}}
-    PUSH_URL=${PUSH_URL:-origin}
     git_user=oauth2
+    if [ -z "${PUSH_URL:-}" ] && [ -n "${CI_SERVER_URL:-}" ]; then
+        PUSH_URL="$CI_SERVER_URL/$CI_PROJECT_PATH.git"
+        # GitLab CI makes git use the job token, which may not push, for URLs of its server.
+        # It leaves a URL that names a user alone, so git asks the credential helper below.
+        case "$PUSH_URL" in
+        http://* | https://*) PUSH_URL="${PUSH_URL/:\/\//://$git_user@}" ;;
+        esac
+    fi
+    PUSH_URL=${PUSH_URL:-origin}
     ;;
 *)
     echo "Set FORGE to github or gitlab" >&2
