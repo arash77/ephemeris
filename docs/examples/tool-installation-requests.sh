@@ -77,6 +77,11 @@ if [ -z "${APPLY_COMMAND:-}" ] && [ -n "${TOOLS_FILE:-}" ]; then
     APPLY_COMMAND='jq -s . "$ITEM" | consume-tool-installation-requests render-yaml --tools-file "$TOOLS_FILE" -o "$TOOLS_FILE"'
 fi
 export FORGE_TOKEN TOOLS_FILE
+# Commit as the person configured in git, or else as this script.
+git_identity=()
+if ! git config user.email > /dev/null; then
+    git_identity=(-c "user.name=Tool installation requests" -c "user.email=tool-installation-requests@localhost")
+fi
 shed_options=(${TOOL_SHED_URL:+--tool-shed-url "$TOOL_SHED_URL"})
 emit_options=()
 eval "emit_options=(${EMIT_OPTIONS:-})"
@@ -87,8 +92,10 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 base=$(git rev-parse HEAD)
+start=$(git symbolic-ref --quiet --short HEAD || echo "$base")
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# Leave the checkout on the branch it was on, which the next run reads BASE_BRANCH from.
+trap 'git checkout --quiet --force "$start"; git clean --quiet --force -d; rm -rf "$work"' EXIT
 
 requests() { consume-tool-installation-requests "$@"; }
 uri() { jq -rn --arg value "$1" '$value | @uri'; }
@@ -238,7 +245,7 @@ handle() {
             # The repository has these tools already, so let an admin look at the request.
             action=issue
         else
-            git commit --quiet --message "$title" || return 1
+            git "${git_identity[@]}" commit --quiet --message "$title" || return 1
             push "$branch" || return 1
             url=$(open_change "$branch" "$title") || return 1
         fi

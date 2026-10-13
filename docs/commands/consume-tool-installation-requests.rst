@@ -146,9 +146,29 @@ them. For those:
 - GitHub's and GitLab's own machines cannot reach a Galaxy server on a private
   network. Run the jobs on a self-hosted runner there instead, or run the script
   from cron on a machine that can reach both Galaxy and the forge, in a
-  checkout it resets before each run::
+  checkout of your tool list repository with ``tool-installation-requests.sh``
+  at its top. Set it up once::
 
-    23 * * * * cd /srv/tools && git fetch -q && git reset -q --hard origin/main && git clean -qfd && FORGE=github FORGE_PROJECT=org/tools EPHEMERIS_GALAXY=https://galaxy.example.org EPHEMERIS_API_KEY=... FORGE_TOKEN=... TOOLS_FILE=requested_tools.yaml EMIT_OPTIONS=--pin-latest bash tool-installation-requests.sh
+    python3 -m venv /srv/tool-requests/venv
+    /srv/tool-requests/venv/bin/pip install ephemeris
+    git clone https://github.com/org/tools /srv/tool-requests/tools
+
+  Put the settings in a file only that user can read,
+  ``/srv/tool-requests/settings``, for example::
+
+    PATH=/srv/tool-requests/venv/bin:$PATH
+    FORGE=github
+    FORGE_PROJECT=org/tools
+    FORGE_TOKEN=...
+    EPHEMERIS_GALAXY=https://galaxy.example.org
+    EPHEMERIS_API_KEY=...
+    TOOLS_FILE=requested_tools.yaml
+    EMIT_OPTIONS=--pin-latest
+
+  and run it every hour from that user's crontab, on the base branch reset
+  before each run::
+
+    23 * * * * cd /srv/tool-requests/tools && git fetch -q && git checkout -qf -B main origin/main && git clean -qfd && set -a && . ../settings && set +a && bash tool-installation-requests.sh
 
 Without a tool list repository, an admin can handle requests by hand: write
 the pull request items to a tool list, review it, install it, and tell the

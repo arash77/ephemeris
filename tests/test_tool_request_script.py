@@ -269,8 +269,12 @@ esac
         "GIT_COMMITTER_EMAIL": "t@t",
         **env,
     }
+    start = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=checkout, capture_output=True, text=True)
     result = subprocess.run(["bash", SCRIPT], cwd=checkout, env=script_env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+    # Cron runs the script again in the same checkout, so it ends where it started.
+    end = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=checkout, capture_output=True, text=True)
+    assert end.stdout == start.stdout
     return [line.split("|")[:-1] for line in log.read_text().splitlines()]
 
 
