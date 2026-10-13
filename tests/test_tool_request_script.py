@@ -361,6 +361,9 @@ def test_script_tells_requesters_how_their_request_ended(tmp_path, forge_server,
     forge.add("issue", _body("c4"), labels=[LABEL, ANSWERED], state="closed", closed_at=_ago(1))
     forge.add("issue", _body("c5"), state="closed", closed_at=_ago(40))
     forge.add("issue", _body("c6"))
+    # A closed duplicate of an open issue.
+    forge.add("issue", _body("c7"), state="closed", closed_at=_ago(1))
+    forge.add("issue", _body("c7"))
 
     env = dict(_ci(kind, api, tmp_path), TOOLS_FILE="tools.yaml")
     calls = _run(tmp_path, [], env, gitlab_ci=kind == "gitlab", installed=["c2"])

@@ -320,8 +320,11 @@ done
 
 # Look at what was closed in the last 30 days, so that pull requests whose tools never get installed
 # are not looked up forever.
-jq -c --arg answered "$ANSWERED_LABEL" --arg since "$(jq -rn 'now - 30 * 86400 | todate')" '
-    select(.id and .state != "open" and (.closed_at // "") >= $since and (.labels | index($answered) | not))' \
+# A request that still has an open one, like the original of a closed duplicate, is not over yet.
+jq -c -s --arg answered "$ANSWERED_LABEL" --arg since "$(jq -rn 'now - 30 * 86400 | todate')" '
+    [.[] | select(.state == "open") | .id] as $open | .[]
+    | select(.id and .state != "open" and (.closed_at // "") >= $since and (.labels | index($answered) | not))
+    | select(.id as $id | $open | index($id) | not)' \
     "$work/artifacts.jsonl" > "$work/closed.jsonl"
 while read -r line <&3; do
     printf '%s\n' "$line" > "$work/artifact.json"
