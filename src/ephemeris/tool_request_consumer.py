@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import (
     datetime,
     timedelta,
@@ -69,6 +70,8 @@ TOOL_SHED_TIMEOUT = 60
 # How long a request waits for the Tool Shed to answer before it becomes an issue anyway.
 TOOL_SHED_PATIENCE = timedelta(days=1)
 TOOL_SHED_ERRORS = (BioblendError, OSError, ValueError)
+# Seconds to wait for a Galaxy that sends notifications in a Celery task.
+REPLY_TIMEOUT = 60
 # The characters the Tool Shed allows in repository names.
 REPOSITORY_NAME = re.compile(r"[a-z0-9_]+")
 
@@ -76,6 +79,10 @@ log = logging.getLogger(__name__)
 
 
 class Unresolved(Exception):
+    pass
+
+
+class ReplyFailed(Exception):
     pass
 
 
@@ -408,7 +415,8 @@ def reply(gi, notification_id: str, url: str) -> bool:
         payload={
             "recipients": {"user_ids": user_ids},
             "notification": {
-                "source": "tool_installation_request_consumer",
+                # Galaxy stores up to 32 characters.
+                "source": "tool_installation_request_reply",
                 "category": "message",
                 "variant": "info",
                 "content": {
@@ -419,8 +427,27 @@ def reply(gi, notification_id: str, url: str) -> bool:
             },
         },
     )
-    # Galaxy skips users who turned message notifications off. With Celery it sends later, without a count.
-    return response.get("total_notifications_sent", 1) > 0
+    if "total_notifications_sent" in response:
+        # Galaxy skips users who turned message notifications off.
+        return response["total_notifications_sent"] > 0
+    # With Celery, Galaxy answers before it sends, so only the task tells whether sending worked.
+    _wait_for_task(gi, response["id"])
+    return True
+
+
+def _wait_for_task(gi, task_id: str) -> None:
+    deadline = time.monotonic() + REPLY_TIMEOUT
+    while True:
+        response = gi.make_get_request(f"{gi.url}/tasks/{task_id}/state")
+        response.raise_for_status()
+        state = response.json()
+        if state == "SUCCESS":
+            return
+        if state == "FAILURE":
+            raise ReplyFailed(f"Galaxy failed to send the reply, see its log for task {task_id}")
+        if time.monotonic() > deadline:
+            raise ReplyFailed(f"Galaxy did not send the reply within {REPLY_TIMEOUT} seconds (task {task_id})")
+        time.sleep(1)
 
 
 def mark_seen(gi, notification_ids: list[str]) -> None:
@@ -527,7 +554,12 @@ def main(argv=None):
         json.dump(items, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.command == "reply":
-        if not reply(gi, args.notification_id, args.url):
+        try:
+            sent = reply(gi, args.notification_id, args.url)
+        except ReplyFailed as e:
+            log.error(f"{e}, so {args.notification_id} stays unseen")
+            return 1
+        if not sent:
             log.warning(
                 f"The requester of {args.notification_id} has no Galaxy account anymore or turned messages off,"
                 " so they were not told"
@@ -537,4 +569,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -20,6 +20,7 @@ from ephemeris.tool_request_consumer import (
     MAX_BODY_LENGTH,
     merge_tool_list,
     reply,
+    ReplyFailed,
     select_requests,
 )
 
@@ -486,6 +487,8 @@ def test_reply_notifies_the_exact_requester():
     assert url == "http://galaxy.test/api/notifications"
     assert payload["recipients"]["user_ids"] == ["u2"]
     assert payload["notification"]["content"]["category"] == "message"
+    # Galaxy stores up to 32 characters, and fails to send a notification with a longer source.
+    assert len(payload["notification"]["source"]) <= 32
     assert "https://github.com/org/tools/pull/7" in payload["notification"]["content"]["message"]
 
     # A requester whose account is gone cannot be answered, which must not stop the run.
@@ -495,3 +498,31 @@ def test_reply_notifies_the_exact_requester():
     # Galaxy sends nothing to users who turned message notifications off.
     sent.count = 0
     assert not reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+
+
+def test_reply_waits_for_galaxy_to_send_it_in_a_task():
+    # With Celery, Galaxy answers with a task, and sends the notification in it.
+    states = {"t1": ["PENDING", "SUCCESS"], "t2": ["STARTED", "FAILURE"]}
+    task = SimpleNamespace(id=None)
+
+    def get(url, params=None):
+        if "/tasks/" in url:
+            state = states[url.split("/")[-2]].pop(0)
+            return SimpleNamespace(json=lambda: state, raise_for_status=lambda: None)
+        return SimpleNamespace(
+            json=lambda: next(n for n in NOTIFICATIONS if url.endswith(n["id"])), raise_for_status=lambda: None
+        )
+
+    gi = SimpleNamespace(
+        url="http://galaxy.test/api",
+        users=SimpleNamespace(get_users=lambda f_email: [{"id": "u2", "email": f_email}]),
+        make_get_request=get,
+        make_post_request=lambda url, payload: {"id": task.id, "ignored": False, "name": None, "queue": None},
+    )
+
+    task.id = "t1"
+    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    # The request then stays unseen, so that the next run answers it.
+    task.id = "t2"
+    with pytest.raises(ReplyFailed):
+        reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
