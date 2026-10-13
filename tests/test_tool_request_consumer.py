@@ -1,30 +1,93 @@
 import json
 import pathlib
 import re
+from datetime import (
+    datetime,
+    timezone,
+)
 from types import SimpleNamespace
 
 import pytest
 import yaml
 from bioblend import ConnectionError as BioblendError
 
+from ephemeris import tool_request_consumer
 from ephemeris.tool_request_consumer import (
+    emit,
     emit_item,
     fetch_notifications,
     main,
+    MAX_BODY_LENGTH,
+    merge_tool_list,
     reply,
     select_requests,
 )
 
 NOTIFICATIONS = json.loads((pathlib.Path(__file__).parent / "tool_installation_requests.json").read_text())
 SHED = "https://toolshed.g2.bx.psu.edu/"
+FAKE_SHED = "https://fake-toolshed.test/"
 LABEL = "Tools from user request"
 
 
-def _emit(notification_id, tools=None):
+def _request(notification_id, tools=None, **fields):
     notification = next(n for n in NOTIFICATIONS if n["id"] == notification_id)
     if tools is not None:
         notification = dict(notification, content=dict(notification["content"], tools=tools))
-    return emit_item(notification, SHED, LABEL)
+    return dict(notification, **fields)
+
+
+def _emit(notification_id, tools=None, shed=SHED):
+    return emit_item(_request(notification_id, tools), shed, LABEL)
+
+
+def _outside_code(markdown):
+    without_blocks = re.sub(r"^(`{3,})\n.*?\n\1$", "", markdown, flags=re.S | re.M)
+    return re.sub(r"`[^`\n]*`", "", without_blocks)
+
+
+class FakeToolShed:
+    """A Tool Shed with only iuc/fastp, failing every lookup with ``error`` if given."""
+
+    def __init__(self, error=None):
+        self.url = FAKE_SHED + "api"
+        self.error = error
+        self.requests = []
+        self.repositories = SimpleNamespace(get_repositories=self.get_repositories)
+
+    def get_repositories(self, name=None, owner=None):
+        self.requests.append((name, owner))
+        if self.error:
+            raise self.error
+        return [{"id": "f1", "owner": "iuc", "name": "fastp"}] if name == "fastp" and owner in (None, "iuc") else []
+
+    def make_get_request(self, url, params=None):
+        assert url == f"{self.url}/repositories/f1/metadata"
+        metadata = {
+            "-1:aaaaaaaaaaaa": {"numeric_revision": None, "changeset_revision": "aaaaaaaaaaaa", "tools": []},
+            "0:36be11c58dac": {"numeric_revision": 0, "changeset_revision": "36be11c58dac", "tools": []},
+            "1:68386e630362": {
+                "numeric_revision": 1,
+                "changeset_revision": "68386e630362",
+                "tools": [{"id": "fastp", "version": "1.3.6+galaxy0"}],
+            },
+        }
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: metadata)
+
+
+@pytest.fixture
+def fake_tool_shed(monkeypatch):
+    def clear_caches():
+        tool_request_consumer._repositories.cache_clear()
+        tool_request_consumer._installable_revisions.cache_clear()
+
+    def install(**kwargs):
+        clear_caches()
+        shed = FakeToolShed(**kwargs)
+        monkeypatch.setattr(tool_request_consumer, "_shed", lambda url: shed)
+        return shed
+
+    yield install
+    clear_caches()
 
 
 def test_emit_pins_requested_versions_in_a_pr():
@@ -59,7 +122,7 @@ def test_emit_falls_back_to_an_issue():
     # bwa 0.7.17 has no installable revision.
     unavailable = _emit("d413a19dec13d11e")
     assert unavailable["action"] == "issue"
-    assert "bwa 0.7.17" in unavailable["body"]
+    assert "| `bwa 0.7.17` | not resolved: `no installable revision has version 0.7.17` | |" in unavailable["body"]
 
     unknown = _emit("b887d74393f85b6d")
     assert unknown["action"] == "issue"
@@ -100,30 +163,153 @@ def test_emit_falls_back_to_an_issue():
     assert other_tool_shed["tools"] == []
 
 
-def test_emit_keeps_user_text_out_of_markdown():
+def test_emit_keeps_user_text_out_of_markdown(fake_tool_shed):
+    fake_tool_shed()
     item = _emit(
         "b2486a20bc56b90f",
         tools=[
             {"name": "@octocat | <b>x</b>"},
-            {"name": "x", "tool_shed_id": "toolshed.g2.bx.psu.edu/repos/@octocat/<b>x|y</b>"},
+            {"name": "x", "tool_shed_id": "fake-toolshed.test/repos/@octocat/<b>x|y</b>"},
         ],
+        shed=FAKE_SHED,
     )
-    outside_code = re.sub(r"`[^`\n]*`", "", re.sub(r"```.*?```", "", item["body"], flags=re.S))
-    assert "@octocat" not in outside_code
-    assert "<b>" not in outside_code
+    assert "@octocat" not in _outside_code(item["body"])
+    assert "<b>" not in _outside_code(item["body"])
 
     # GitHub rejects titles over 256 characters and bodies over 65536.
-    long_names = _emit("b2486a20bc56b90f", tools=[{"name": "x" * 255}, {"name": "y" * 255}])
+    long_names = _emit("b2486a20bc56b90f", tools=[{"name": "x" * 255}, {"name": "y" * 255}], shed=FAKE_SHED)
     assert len(long_names["title"]) <= 256
-    long_descriptions = _emit("b2486a20bc56b90f", tools=[{"tool_url": "https://x.org", "description": "d" * 5000}] * 50)
-    assert len(long_descriptions["body"]) <= 65536
+
+
+def test_emit_fits_long_requests_into_the_body_limit(fake_tool_shed):
+    fake_tool_shed()
+    # The largest request Galaxy accepts: 50 tools with long URLs and descriptions.
+    unnamed = {"tool_url": "https://x.org/ @victim " + "u" * 2000, "description": "d @victim " * 500}
+    pinned = {"name": "fastp", "requested_version": "1.3.6+galaxy0", "description": "d" * 5000}
+    item = _emit("b2486a20bc56b90f", tools=[unnamed] * 30 + [pinned] * 20, shed=FAKE_SHED)
+
+    assert len(item["body"]) <= MAX_BODY_LENGTH
+    assert "(Truncated, the full request is in Galaxy.)" in item["body"]
+    assert "@victim" not in _outside_code(item["body"])
+    # The tool list entries come last, whole.
+    entries = item["body"].rsplit("Tool list entries:\n```\n", 1)[1]
+    assert entries.endswith("\n```")
+    assert yaml.safe_load(entries[: -len("\n```")])["tools"][0]["revisions"] == ["68386e630362"]
+
+
+def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
+    shed = fake_tool_shed()
+    item = _emit(
+        "b2486a20bc56b90f",
+        tools=[
+            {"name": " FastP ", "requested_version": "1.3.6+galaxy0"},
+            {"name": "fastp", "requested_version": "1.3.6+galaxy0"},
+            # No repository name has these characters, so this needs no lookup.
+            {"name": "bowtie2: map"},
+        ],
+        shed=FAKE_SHED,
+    )
+    assert item["tools"] == [
+        {
+            "name": "fastp",
+            "owner": "iuc",
+            "tool_shed_url": FAKE_SHED,
+            "tool_panel_section_label": LABEL,
+            "revisions": ["68386e630362"],
+        }
+    ]
+    assert shed.requests == [("fastp", None)]
+
+
+def test_emit_gives_unpinned_tools_their_own_entry(fake_tool_shed):
+    fake_tool_shed()
+    item = _emit(
+        "b2486a20bc56b90f",
+        tools=[{"name": "fastp", "requested_version": "1.3.6+galaxy0"}, {"name": "fastp"}],
+        shed=FAKE_SHED,
+    )
+    assert item["action"] == "issue"
+    entry = {"name": "fastp", "owner": "iuc", "tool_shed_url": FAKE_SHED, "tool_panel_section_label": LABEL}
+    assert item["tools"] == [dict(entry, revisions=["68386e630362"]), entry]
+
+
+def test_emit_turns_tool_shed_rejections_into_issues(fake_tool_shed):
+    fake_tool_shed(error=BioblendError("GET: error 403", status_code=403))
+    rejected = _emit("b2486a20bc56b90f", shed=FAKE_SHED)
+    assert rejected["action"] == "issue"
+    assert "the Tool Shed rejected the lookup with HTTP 403" in rejected["body"]
+
+    # Left unseen, a request that hit a Tool Shed error is emitted again by the next run.
+    fake_tool_shed(error=BioblendError("GET: error 502", status_code=502))
+    with pytest.raises(BioblendError):
+        _emit("b2486a20bc56b90f", shed=FAKE_SHED)
+
+
+def test_emit_waits_a_day_for_the_tool_shed(fake_tool_shed):
+    now = datetime.now(timezone.utc).isoformat()
+    fresh = _request("b2486a20bc56b90f", id="fresh", publication_time=now)
+    also_fresh = _request("b2486a20bc56b90f", id="also_fresh", publication_time=now)
+    old = _request("b2486a20bc56b90f", id="old", publication_time="2026-01-01T00:00:00")
+
+    shed = fake_tool_shed(error=BioblendError("GET: error 502", status_code=502))
+    [item] = emit([fresh, old], FAKE_SHED, LABEL)
+    assert item["notification_id"] == "old"
+    assert item["action"] == "issue"
+    assert "not looked up, the Tool Shed failed: GET: error 502" in item["body"]
+    assert len(shed.requests) == 2
+
+    # A Tool Shed that does not answer at all is not asked again in the same run.
+    shed = fake_tool_shed(error=BioblendError("Connection refused"))
+    assert [i["notification_id"] for i in emit([fresh, also_fresh, old], FAKE_SHED, LABEL)] == ["old"]
+    assert len(shed.requests) == 1
 
 
 def test_emit_fails_while_the_tool_shed_is_down():
-    # Left unseen, the request is emitted again by the next run instead of becoming an issue.
     notification = next(n for n in NOTIFICATIONS if n["id"] == "b2486a20bc56b90f")
     with pytest.raises((BioblendError, OSError)):
         emit_item(notification, "https://toolshed.invalid/", LABEL)
+    assert tool_request_consumer._shed("https://toolshed.invalid/").timeout == tool_request_consumer.TOOL_SHED_TIMEOUT
+
+
+def test_emit_titles_pull_requests_with_tool_shed_data_only(fake_tool_shed):
+    fake_tool_shed()
+    # Only text after the last "://" used to be compared with the configured Tool Shed.
+    disguised = _emit(
+        "0aab0e4c25198ad8",
+        tools=[
+            {
+                "name": None,
+                "tool_shed_id": "Fixes #1 @victim x://fake-toolshed.test/repos/iuc/fastp",
+                "requested_version": "1.3.6+galaxy0",
+            }
+        ],
+        shed=FAKE_SHED,
+    )
+    assert disguised["action"] == "issue"
+    assert disguised["tools"] == []
+
+    by_id = _emit(
+        "0aab0e4c25198ad8",
+        tools=[
+            {
+                "name": None,
+                "tool_shed_id": "http://Fake-ToolShed.test/repos/iuc/fastp",
+                "requested_version": "1.3.6+galaxy0",
+            }
+        ],
+        shed=FAKE_SHED,
+    )
+    assert by_id["action"] == "pr"
+    assert by_id["title"] == "Install fastp 1.3.6+galaxy0"
+
+    by_name = _emit("b2486a20bc56b90f", tools=[{"name": "FASTP", "requested_version": "1.3.6+galaxy0"}], shed=FAKE_SHED)
+    assert by_name["action"] == "pr"
+    assert by_name["title"] == "Install fastp 1.3.6+galaxy0"
+
+    # Issue titles keep what users typed, on one line.
+    multiline = _emit("b2486a20bc56b90f", tools=[{"name": "fast\np\n\nFixes #1"}], shed=FAKE_SHED)
+    assert multiline["action"] == "issue"
+    assert multiline["title"] == "Install fast p Fixes #1"
 
 
 def test_select_requests_skips_seen_deleted_and_other_categories():
@@ -136,12 +322,13 @@ def test_select_requests_skips_seen_deleted_and_other_categories():
     assert [n["id"] for n in select_requests([seen], include_seen=True)] == ["a1"]
 
 
-def test_fetch_notifications_reads_every_page():
+def test_fetch_notifications_reads_all_at_once():
+    # Galaxy does not order notifications, so pages could skip some.
     notifications = [{"id": str(i)} for i in range(250)]
 
     def get(url, params):
-        start, end = params["offset"], params["offset"] + params["limit"]
-        return SimpleNamespace(json=lambda: notifications[start:end], raise_for_status=lambda: None)
+        assert params == {"limit": 0}
+        return SimpleNamespace(json=lambda: notifications, raise_for_status=lambda: None)
 
     gi = SimpleNamespace(url="http://galaxy.test/api", make_get_request=get)
     assert fetch_notifications(gi) == notifications
@@ -169,9 +356,17 @@ def test_render_yaml_adds_revisions_to_existing_entries(tmp_path):
         "revisions": ["9a77d5fca67c"],
     }
     items = [
-        {"tools": [{"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}]},
-        {"tools": [new_entry]},
-        {"tools": [{"name": "regex_find_replace", "owner": "jjohnson", "revisions": ["9ea374bb0350"]}]},
+        {
+            "action": "pr",
+            "tools": [{"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}],
+        },
+        {"action": "pr", "tools": [new_entry]},
+        {
+            "action": "pr",
+            "tools": [{"name": "regex_find_replace", "owner": "jjohnson", "revisions": ["9ea374bb0350"]}],
+        },
+        # Issue items wait for the admins.
+        {"action": "issue", "tools": [{"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}]},
     ]
 
     tools_file = tmp_path / "tools.yaml"
@@ -201,6 +396,68 @@ def test_render_yaml_adds_revisions_to_existing_entries(tmp_path):
     assert render_yaml() == merged
 
 
+def test_render_yaml_reads_revisions_like_shed_tools():
+    existing = {
+        "tools": [
+            # shed-tools installs the latest revision for these.
+            {"name": "null_revisions", "owner": "o", "revisions": None},
+            {"name": "no_revisions", "owner": "o", "revisions": []},
+            {"name": "changeset_pin", "owner": "o", "changeset_revision": "36be11c58dac"},
+            # An unquoted revision made of digits loads as a number.
+            {"name": "numeric", "owner": "o", "revisions": [123456789012]},
+        ]
+    }
+    items = [
+        {
+            "action": "pr",
+            "tools": [
+                {"name": "null_revisions", "owner": "o", "revisions": ["68386e630362"]},
+                {"name": "no_revisions", "owner": "o", "revisions": ["68386e630362"]},
+                {"name": "changeset_pin", "owner": "o", "revisions": ["68386e630362"]},
+                {"name": "numeric", "owner": "o", "revisions": ["123456789012"]},
+            ],
+        }
+    ]
+
+    assert merge_tool_list(existing, items)["tools"] == [
+        {"name": "null_revisions", "owner": "o", "revisions": None},
+        {"name": "no_revisions", "owner": "o", "revisions": []},
+        {"name": "changeset_pin", "owner": "o", "revisions": ["36be11c58dac", "68386e630362"]},
+        {"name": "numeric", "owner": "o", "revisions": [123456789012]},
+    ]
+
+
+def test_render_yaml_leaves_a_tool_list_that_has_the_revisions_alone(tmp_path):
+    # Listed twice, and once with an http:// Tool Shed URL.
+    tools = """\
+# Requested tools
+tools:
+  - name: fastp
+    owner: iuc
+    tool_shed_url: http://toolshed.g2.bx.psu.edu
+    revisions: ['68386e630362']
+  - name: fastp
+    owner: iuc
+    revisions: ['36be11c58dac']
+"""
+    tools_file = tmp_path / "tools.yaml"
+    tools_file.write_text(tools)
+    items_file = tmp_path / "items.json"
+    items_file.write_text(
+        json.dumps(
+            [
+                {
+                    "action": "pr",
+                    "tools": [{"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}],
+                }
+            ]
+        )
+    )
+
+    main(["render-yaml", "--items", str(items_file), "--tools-file", str(tools_file), "-o", str(tools_file)])
+    assert tools_file.read_text() == tools
+
+
 def test_reply_notifies_the_exact_requester():
     # Galaxy's f_email filter is a substring match.
     users = [
@@ -208,16 +465,22 @@ def test_reply_notifies_the_exact_requester():
         {"id": "u2", "email": "toolrequester@galaxy.test"},
     ]
     posted = []
+    sent = SimpleNamespace(count=1)
+
+    def post(url, payload):
+        posted.append((url, payload))
+        return {"total_notifications_sent": sent.count, "notification": {}}
+
     gi = SimpleNamespace(
         url="http://galaxy.test/api",
         users=SimpleNamespace(get_users=lambda f_email: [u for u in users if f_email in u["email"]]),
         make_get_request=lambda url, params=None: SimpleNamespace(
             json=lambda: next(n for n in NOTIFICATIONS if url.endswith(n["id"])), raise_for_status=lambda: None
         ),
-        make_post_request=lambda url, payload: posted.append((url, payload)),
+        make_post_request=post,
     )
 
-    reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
 
     [(url, payload)] = posted
     assert url == "http://galaxy.test/api/notifications"
@@ -226,5 +489,9 @@ def test_reply_notifies_the_exact_requester():
     assert "https://github.com/org/tools/pull/7" in payload["notification"]["content"]["message"]
 
     # A requester whose account is gone cannot be answered, which must not stop the run.
-    reply(gi, "b887d74393f85b6d", "https://github.com/org/tools/issues/8")
+    assert not reply(gi, "b887d74393f85b6d", "https://github.com/org/tools/issues/8")
     assert len(posted) == 1
+
+    # Galaxy sends nothing to users who turned message notifications off.
+    sent.count = 0
+    assert not reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
