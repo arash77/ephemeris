@@ -23,6 +23,8 @@
 #                    $ITEM to the checkout, for repositories that are not a single
 #                    tool list. Defaults to render-yaml into TOOLS_FILE.
 # ISSUE_LABEL        Label of the issues opened here (default: tool installation request).
+# EMIT_OPTIONS       Options for emit, written as in a shell, for example
+#                    --tool-shed-url https://toolshed.example.org/ --panel-label 'Other Tools'.
 #
 # Without TOOLS_FILE or APPLY_COMMAND, every request becomes an issue.
 set -euo pipefail
@@ -195,7 +197,7 @@ for ((page = 1; ; page++)); do
     jq -c "$issue_fields" "$work/page.json" >> "$work/issues.jsonl"
 done
 
-consume-tool-installation-requests emit > "$work/requests.json"
+eval "consume-tool-installation-requests emit ${EMIT_OPTIONS:-}" > "$work/requests.json"
 failed=0
 for i in $(seq 0 $(($(jq length "$work/requests.json") - 1))); do
     jq ".[$i]" "$work/requests.json" > "$work/item.json"

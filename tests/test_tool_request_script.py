@@ -162,7 +162,7 @@ def _run(tmp_path, requests, env, gitlab_ci=False):
     bin_dir.mkdir()
     stub = bin_dir / "consume-tool-installation-requests"
     stub.write_text(f"""#!/bin/bash
-echo "$*" >> {tmp_path / "galaxy.log"}
+printf '%s|' "$@" >> {tmp_path / "galaxy.log"}; echo >> {tmp_path / "galaxy.log"}
 case "$1" in
   emit) cat {tmp_path / "requests.json"} ;;
   render-yaml) exec {sys.executable} -m ephemeris.tool_request_consumer "$@" ;;
@@ -183,13 +183,10 @@ esac
     }
     result = subprocess.run(["bash", SCRIPT], cwd=checkout, env=script_env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    replies = {}
-    for line in (tmp_path / "galaxy.log").read_text().splitlines():
-        command, *args = line.split()
-        if command == "reply":
-            replies[args[1]] = args[3]
-    seen = [line.split()[1] for line in (tmp_path / "galaxy.log").read_text().splitlines() if line.startswith("mark")]
-    return replies, seen
+    calls = [line.split("|")[:-1] for line in (tmp_path / "galaxy.log").read_text().splitlines()]
+    replies = {args[2]: args[4] for args in calls if args[0] == "reply"}
+    seen = [args[1] for args in calls if args[0] == "mark-seen"]
+    return replies, seen, calls
 
 
 @pytest.mark.parametrize("kind", ["github", "gitlab"])
@@ -234,7 +231,7 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
         }
 
     existing = len(forge.issues)
-    replies, seen = _run(tmp_path, requests, dict(ci, TOOLS_FILE="tools.yaml"), gitlab_ci=kind == "gitlab")
+    replies, seen, _ = _run(tmp_path, requests, dict(ci, TOOLS_FILE="tools.yaml"), gitlab_ci=kind == "gitlab")
 
     [new_change] = [c for c in forge.changes if c["branch"] == "tool-request/n1"]
     assert (new_change["base"], new_change["title"]) == ("main", "Install bwa 0.7.18")
@@ -255,9 +252,10 @@ def test_script_opens_only_issues_without_a_tool_list(tmp_path, forge_server):
     forge, api = forge_server("github")
     bwa = {"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}
 
-    env = {"FORGE": "github", "FORGE_API": api, "FORGE_PROJECT": "org/tools"}
-    replies, seen = _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
+    env = {"FORGE": "github", "FORGE_API": api, "FORGE_PROJECT": "org/tools", "EMIT_OPTIONS": "-l 'Other Tools'"}
+    replies, seen, calls = _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
 
+    assert calls[0] == ["emit", "-l", "Other Tools"]
     assert forge.changes == []
     assert replies["n1"] == forge.issues[0]["url"]
     assert seen == ["n1"]
