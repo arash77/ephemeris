@@ -774,8 +774,9 @@ def main(argv=None):
             return 2
         try:
             sent = reply(gi, args.notification_id, args.url, args.state)
-        except ReplyFailed as e:
-            log.error(f"{e}, so the requester of {args.notification_id} was not told")
+        except (ReplyFailed, BioblendError, OSError) as e:
+            # For example, Galaxy limits how many notifications an account may send per minute.
+            log.error(f"Could not tell the requester of {args.notification_id}: {e}")
             return 1
         if not sent:
             log.warning(
@@ -783,11 +784,20 @@ def main(argv=None):
                 "turned messages off, so they were not told"
             )
     elif args.command == "installed":
-        notification = _notification(gi, args.notification_id)
-        answer = notification is not None and installed(gi, notification, format_tool_shed_url(args.tool_shed_url))
+        try:
+            notification = _notification(gi, args.notification_id)
+            shed_url = format_tool_shed_url(args.tool_shed_url)
+            answer = notification is not None and installed(gi, notification, shed_url)
+        except TOOL_SHED_ERRORS as e:
+            log.error(f"Could not check whether the tools of {args.notification_id} are installed: {e}")
+            return 1
         print("yes" if answer else "no")
     elif args.command == "mark-seen":
-        mark_seen(gi, args.notification_ids)
+        try:
+            mark_seen(gi, args.notification_ids)
+        except (BioblendError, OSError) as e:
+            log.error(f"Could not mark {' '.join(args.notification_ids)} as seen: {e}")
+            return 1
 
 
 if __name__ == "__main__":

@@ -569,6 +569,23 @@ def test_reply_notifies_the_exact_requester():
     assert not reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
 
 
+def test_reply_reports_galaxy_refusing_it(monkeypatch, caplog):
+    def post(url, payload):
+        raise BioblendError("Unexpected HTTP status code: 429", status_code=429)
+
+    gi = SimpleNamespace(
+        url="http://galaxy.test/api",
+        users=SimpleNamespace(get_users=lambda f_email: [{"id": "u2", "email": f_email}]),
+        make_get_request=_galaxy_get,
+        make_post_request=post,
+    )
+    monkeypatch.setattr(tool_request_consumer, "get_galaxy_connection", lambda args, log, login_required: gi)
+
+    # Galaxy limits how many notifications an account sends per minute, so the next run tries again.
+    assert main(["reply", "--notification-id", "b2486a20bc56b90f", "--url", "https://github.com/org/tools/pull/7"]) == 1
+    assert "Could not tell the requester of b2486a20bc56b90f" in caplog.text
+
+
 def test_reply_tells_how_the_request_ended():
     posted = []
 
