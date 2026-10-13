@@ -50,9 +50,12 @@ On GitHub:
 - enable "Allow GitHub Actions to create and approve pull requests" in the
   repository's Actions settings.
 
-Pull requests opened with the default ``GITHUB_TOKEN`` do not start other
-workflows. To run your tool installation tests on them, put a GitHub App or
-personal access token in ``FORGE_TOKEN`` instead.
+Workflows on pull requests opened with the default ``GITHUB_TOKEN`` only run
+once someone approves them. To run your tool installation tests without that,
+put a GitHub App or personal access token in ``FORGE_TOKEN`` instead. If the
+repository may not open pull requests, requests become issues. GitHub turns off
+scheduled workflows in public repositories after 60 days without activity, so
+turn it on again in the Actions tab if your server gets few requests.
 
 On GitLab:
 
@@ -60,10 +63,14 @@ On GitLab:
   the job below to ``.gitlab-ci.yml``,
 - set ``EPHEMERIS_GALAXY``, and ``TOOLS_FILE`` or ``APPLY_COMMAND``,
 - add the API key of an admin account as the masked ``EPHEMERIS_API_KEY``
-  CI/CD variable, and a project access token with the ``api`` and
-  ``write_repository`` scopes and at least the Developer role as the masked
-  ``FORGE_TOKEN`` variable, since the CI job token cannot push branches,
-- create a pipeline schedule, for example every hour.
+  CI/CD variable, and a token with the ``api`` and ``write_repository`` scopes
+  as the masked ``FORGE_TOKEN`` variable, since the CI job token cannot push
+  branches or open issues. That is a project access token with at least the
+  Developer role, or, on gitlab.com's Free tier, which has none, the personal
+  access token of an account made for this,
+- create a pipeline schedule, for example every hour, or every few hours on
+  gitlab.com's Free tier, whose compute minutes would not last a month of
+  hourly runs.
 
 The script labels the issues and pull requests it opens with ``REQUEST_LABEL``
 and tells the requester where their request is handled. It finds the issues
@@ -73,27 +80,48 @@ per minute (``send_notification_rate_limit``), is picked up by the next one
 without opening duplicates. A pull request item whose tools are in the
 repository already becomes an issue instead.
 
+``EPHEMERIS_API_KEY`` must belong to an account in Galaxy's ``admin_users``
+that keeps tool installation requests turned on in its notification
+preferences, since Galaxy sends requests to those accounts only. To make the
+script skip a request, delete it there.
+
 Admins can read and mark requests in Galaxy as they like. ``emit`` picks up
 unseen requests, and also requests marked as seen that arrived after the
 script's first issue or pull request and have none yet. So the script can use
 the account of the only admin of a small Galaxy, and on its first run it leaves
-alone the requests that admins read before.
+alone the requests that admins read before. It does mark the requests it
+handled as seen, though, and GitHub and GitLab do not tell you about issues
+opened with your own token. So if the script uses both your Galaxy account and
+your own token, use an account made for this on the forge, or watch the
+repository's issues, to hear about new requests. In GitHub Actions, the
+default ``GITHUB_TOKEN`` opens them as ``github-actions``.
 
 Once an issue or pull request is closed, the script asks Galaxy whether the
 requested tools are installed now, and tells the requester that they are, or
 that the request was closed without installing them. It then adds
 ``ANSWERED_LABEL``. It waits for the tools of a merged pull request to be
 installed, by an install job like the one below or by hand, and gives up on
-those closed more than 30 days ago. Only tools found on the Tool Shed can be
+those closed more than 30 days ago, without telling the requester. It checks
+on the Tool Shed in ``TOOL_SHED_URL``, so set that, rather than
+``--tool-shed-url`` in ``EMIT_OPTIONS``, to use another one. Only tools found on the Tool Shed can be
 checked, so a request with others is told that it was closed.
 
 Request pull requests all start from the same base branch, so merging one can
-make others conflict, like any pull requests that change the same lines. An
-``APPLY_COMMAND`` that inserts tools in sorted order, instead of at the end of
-a file, avoids most of these conflicts.
+make others that change the same tool list conflict. Resolve those like any
+conflict, or avoid them with a file per request, like Galaxy Australia's tool
+list does::
+
+    APPLY_COMMAND='mkdir -p requests && jq -s . "$ITEM" | consume-tool-installation-requests render-yaml -o "requests/$(jq -r .notification_id "$ITEM").yaml"'
+
+Then pull requests never conflict, but also no longer become issues when the
+tool list has their tools already. Install every file there, for example with
+``for f in requests/*.yaml; do shed-tools install --tools-file "$f"; done``,
+which skips the tools Galaxy has already.
 
 ``render-yaml`` leaves a tool list that gains nothing as it is, and rewrites
-one that gains tools without its comments. Like ``shed-tools``, it reads an
+one that gains tools without its comments. A tool list it starts asks
+``shed-tools`` to install the tools' dependencies, which it otherwise does
+not. Like ``shed-tools``, it reads an
 entry with neither ``revisions`` nor ``changeset_revision`` as following the
 latest revision, and leaves that repository alone. An entry pinned with
 ``changeset_revision`` that gains a revision gets a ``revisions`` list instead.

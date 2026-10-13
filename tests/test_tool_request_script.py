@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from urllib.parse import (
 )
 
 import pytest
+import yaml
 
 SCRIPT = pathlib.Path(__file__).parent.parent / "docs" / "examples" / "tool-installation-requests.sh"
 LABEL = "tool installation request"
@@ -50,6 +52,8 @@ class FakeForge:
         self.kind = kind
         self.prefix = "/repos/org/tools" if kind == "github" else "/projects/7"
         self.items = []
+        # GitHub Actions may not be allowed to open pull requests.
+        self.refuse_changes = False
 
     def add(self, kind, body="", labels=(LABEL,), state="open", closed_at=None, branch=None, from_fork=False, **fields):
         number = len(self.items) + 1
@@ -128,6 +132,8 @@ class FakeForge:
                 found = [i for i in self.items if i["branch"] == branch and owner == "org" and not i["from_fork"]]
                 return 200, [render(i) for i in found]
             return 200, [render(i) for i in self.items if i["branch"] == query["source_branch"]]
+        if method == "POST" and resource in ("/pulls", "/merge_requests") and self.refuse_changes:
+            return 403, {"message": "GitHub Actions is not permitted to create or approve pull requests."}
         if method == "POST" and resource == "/pulls":
             change = self.add("change", payload["body"], (), branch=payload["head"], base=payload["base"])
             return 201, dict(render(change), title=payload["title"])
@@ -321,9 +327,10 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
     env = dict(_ci(kind, api, tmp_path), TOOLS_FILE="tools.yaml")
     calls = _run(tmp_path, requests, env, gitlab_ci=kind == "gitlab")
 
-    # Requests an admin read in Galaxy are handled too, unless they have an issue or pull request.
+    # Requests an admin read in Galaxy are handled too, if they arrived after the first issue or pull
+    # request for a request, and have none yet.
     [emit] = [args for args in calls if args[0] == "emit"]
-    assert emit[emit.index("--seen-since") + 1] == "2026-09-01T00:00:00Z"
+    assert emit[emit.index("--seen-since") + 1] == "2026-10-01T00:00:00Z"
     assert [args[1] for args in calls if args[0] == "handled"] == ["n2"]
     new = forge.items[existing:]
     [new_change] = [i for i in new if i["branch"] == "tool-request/n1"]
@@ -336,6 +343,8 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
     assert replies["n1"] == (new_change["url"], "handling")
     assert replies["n2"] == (reused_issue, "handling")
     assert replies["n4"] == (reused_change, "handling")
+    # Labelled now, so that later runs know it is handled.
+    assert [i["labels"] for i in forge.items if i["url"] == reused_change] == [[LABEL]]
     new_issues = {i["url"]: i for i in new if i["kind"] == "issue"}
     assert set(new_issues) == {replies["n3"][0], replies["n5"][0]}
     assert all(i["labels"] == [LABEL] for i in new_issues.values())
@@ -375,3 +384,40 @@ def test_script_opens_only_issues_without_a_tool_list(tmp_path, forge_server):
     assert "--seen-since" not in emit
     assert [i["kind"] for i in forge.items] == ["issue"]
     assert _replies(calls)["n1"] == (forge.items[0]["url"], "handling")
+
+
+def test_script_opens_an_issue_when_it_may_not_open_pull_requests(tmp_path, forge_server):
+    forge, api = forge_server("github")
+    forge.refuse_changes = True
+    bwa = {"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}
+
+    env = {"FORGE": "github", "FORGE_API": api, "FORGE_PROJECT": "org/tools", "TOOLS_FILE": "tools.yaml"}
+    calls = _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
+
+    assert [(i["kind"], i["labels"]) for i in forge.items] == [("issue", [LABEL])]
+    assert _replies(calls)["n1"] == (forge.items[0]["url"], "handling")
+
+
+def test_script_can_add_a_file_per_request(tmp_path, forge_server):
+    forge, api = forge_server("github")
+    bwa = {"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}
+    # The recipe from the docs, which avoids conflicts between request pull requests.
+    docs = (
+        pathlib.Path(__file__).parent.parent / "docs" / "commands" / "consume-tool-installation-requests.rst"
+    ).read_text()
+    apply_command = re.search(r"^    APPLY_COMMAND='(.*)'$", docs, re.M).group(1)
+
+    env = {"FORGE": "github", "FORGE_API": api, "FORGE_PROJECT": "org/tools", "APPLY_COMMAND": apply_command}
+    _run(tmp_path, [_item("n1", "pr", "Install bwa 0.7.18", [bwa])], env)
+
+    assert [i["kind"] for i in forge.items] == ["change"]
+    added = subprocess.run(
+        ["git", "show", "tool-request/n1:requests/n1.yaml"], cwd=tmp_path / "origin.git", capture_output=True, text=True
+    ).stdout
+    # shed-tools installs dependencies only when the tool list asks for them.
+    assert yaml.safe_load(added) == {
+        "install_tool_dependencies": False,
+        "install_repository_dependencies": True,
+        "install_resolver_dependencies": True,
+        "tools": [bwa],
+    }

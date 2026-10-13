@@ -77,6 +77,12 @@ TOOL_SHED_PATIENCE = timedelta(days=1)
 TOOL_SHED_ERRORS = (BioblendError, OSError, ValueError)
 # Seconds to wait for a Galaxy that sends notifications in a Celery task.
 REPLY_TIMEOUT = 60
+# How a tool list that render-yaml starts installs its tools.
+NEW_TOOL_LIST = {
+    "install_tool_dependencies": False,
+    "install_repository_dependencies": True,
+    "install_resolver_dependencies": True,
+}
 # Subject, message, and what the link in the message points to, for each state of a request.
 REPLIES = {
     "handling": (
@@ -371,8 +377,9 @@ def emit_item(
     labels = confirmed_labels if action == "pr" else [" ".join(_label(t).split()) for t in content["tools"]]
     labels = list(dict.fromkeys(labels))
     title = "Install " + ", ".join(labels[:3]) + (f" and {len(labels) - 3} more" if len(labels) > 3 else "")
-    if len(title) > 256:
-        title = title[:253] + "..."
+    # GitLab allows 255 characters, and GitHub 256.
+    if len(title) > 255:
+        title = title[:252] + "..."
     body = [
         f"Tool installation request from Galaxy (notification `{notification['id']}`).",
         "",
@@ -492,7 +499,8 @@ def merge_tool_list(existing: dict | None, items: list[dict]) -> dict:
     repository with an entry that follows the latest revision is left alone, and a
     ``changeset_revision`` pin that gains revisions becomes a ``revisions`` list.
     """
-    merged = dict(existing or {})
+    # shed-tools only installs the dependencies of tools when the tool list asks for them.
+    merged = dict(existing) if existing is not None else dict(NEW_TOOL_LIST)
     tools = [dict(t) for t in merged.get("tools") or []]
     by_repository: dict[tuple[str, str, str], list[dict]] = {}
     for tool in tools:
@@ -583,7 +591,9 @@ def _wait_for_task(gi, task_id: str) -> None:
         if state == "FAILURE":
             raise ReplyFailed(f"Galaxy failed to send the reply, see its log for task {task_id}")
         if time.monotonic() > deadline:
-            raise ReplyFailed(f"Galaxy did not send the reply within {REPLY_TIMEOUT} seconds (task {task_id})")
+            # Asking again could send the requester the same message twice, once Galaxy catches up.
+            log.warning(f"Galaxy has not sent the reply within {REPLY_TIMEOUT} seconds, see its log for task {task_id}")
+            return
         time.sleep(1)
 
 

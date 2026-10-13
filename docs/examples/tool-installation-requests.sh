@@ -23,7 +23,8 @@
 # APPLY_COMMAND      Shell command that adds the tools of the work item in the file
 #                    $ITEM to the checkout, for repositories that are not a single
 #                    tool list. Defaults to render-yaml into TOOLS_FILE.
-# TOOL_SHED_URL      Tool Shed to look requested tools up on (default: the main one).
+# TOOL_SHED_URL      Tool Shed to look requested tools up on, and to check installed
+#                    tools against (default: the main one).
 # EMIT_OPTIONS       More options for emit, written as in a shell, for example
 #                    --panel-label 'Other Tools' --pin-latest.
 # REQUEST_LABEL      Label of the issues and pull requests opened here
@@ -115,6 +116,8 @@ api() {
     # Headers come from a file, so that the token stays out of the process list.
     status=$(curl --silent --show-error --output "$work/response.json" --write-out '%{http_code}' \
         --request "$1" --header @<(headers) ${3:+--data-binary "@$3"} "$FORGE_API/$project$2") || return 1
+    # Callers in a subshell read the status from here.
+    echo "$status" > "$work/status"
     if [ "$status" -ge 300 ]; then
         echo "$1 $2 failed with HTTP $status: $(head -c 500 "$work/response.json")" >&2
         return 1
@@ -150,9 +153,10 @@ if [ "$FORGE" = github ]; then
             closed_at: (.pull_request.merged_at // .closed_at)} | $artifact"
     }
 
-    # Prints the URL of a pull request from this repository's branch $1, open or not.
+    # Prints the URL and number of a pull request from this repository's branch $1, open or not.
     find_change() {
-        api GET "/pulls?state=all&head=$(uri "${FORGE_PROJECT%%/*}:$1")" | jq -r '.[0].html_url // empty'
+        api GET "/pulls?state=all&head=$(uri "${FORGE_PROJECT%%/*}:$1")" |
+            jq -r '.[0] | select(.) | "\(.html_url) \(.number)"'
     }
 
     # add_label KIND NUMBER LABEL
@@ -165,7 +169,8 @@ if [ "$FORGE" = github ]; then
         jq -n --arg head "$1" --arg base "$BASE_BRANCH" --arg title "$2" --rawfile body "$work/body.md" \
             '{$head, $base, $title, $body}' > "$work/payload.json"
         api POST /pulls "$work/payload.json" > "$work/change.json" || return 1
-        add_label change "$(jq -r .number "$work/change.json")" "$REQUEST_LABEL" || return 1
+        # A later run labels it if this fails, when it finds the pull request by its branch.
+        add_label change "$(jq -r .number "$work/change.json")" "$REQUEST_LABEL" || true
         jq -r .html_url "$work/change.json"
     }
 
@@ -189,10 +194,10 @@ else
             closed_at: (.merged_at // .closed_at)} | $artifact"
     }
 
-    # Prints the URL of a merge request from this project's branch $1, open or not.
+    # Prints the URL and number of a merge request from this project's branch $1, open or not.
     find_change() {
         api GET "/merge_requests?state=all&source_branch=$(uri "$1")" |
-            jq -r 'map(select(.source_project_id == .target_project_id))[0].web_url // empty'
+            jq -r 'map(select(.source_project_id == .target_project_id))[0] | select(.) | "\(.web_url) \(.iid)"'
     }
 
     add_label() {
@@ -226,7 +231,7 @@ push() {
 
 # Opens an issue or a pull request for the work item, unless an earlier run did, and tells the requester.
 handle() {
-    local id action title branch url
+    local id action title branch url found number
     jq -r .body "$work/item.json" > "$work/body.md"
     id=$(jq -r .notification_id "$work/item.json")
     action=$(jq -r .action "$work/item.json")
@@ -235,7 +240,12 @@ handle() {
     # Reuse what an earlier run opened, also if the request turned from an issue into a pull request since.
     url=$(jq -rn --arg id "$id" 'first(inputs | select(.id == $id) | .url) // empty' "$work/artifacts.jsonl")
     if [ -z "$url" ]; then
-        url=$(find_change "$branch") || return 1
+        found=$(find_change "$branch") || return 1
+        read -r url number <<< "$found"
+        if [ -n "$url" ]; then
+            # Without the label, later runs would not know the request is handled, and tell the requester again.
+            add_label change "$number" "$REQUEST_LABEL" || echo "Could not label $url" >&2
+        fi
     fi
     if [ -z "$url" ] && [ "$action" = pr ] && [ -n "${APPLY_COMMAND:-}" ]; then
         git switch --quiet -C "$branch" "$base" || return 1
@@ -247,7 +257,12 @@ handle() {
         else
             git "${git_identity[@]}" commit --quiet --message "$title" || return 1
             push "$branch" || return 1
-            url=$(open_change "$branch" "$title") || return 1
+            if ! url=$(open_change "$branch" "$title"); then
+                # For example, GitHub Actions may not be allowed to open pull requests.
+                [ "$(cat "$work/status")" = 403 ] || return 1
+                echo "Not allowed to open a pull request for $id, so opening an issue" >&2
+                url=""
+            fi
         fi
     fi
     if [ -z "$url" ]; then
@@ -288,7 +303,7 @@ done
 list_artifacts
 jq -r 'select(.id) | .id' "$work/artifacts.jsonl" > "$work/handled.txt"
 # Requests sent since the first issue or pull request are handled here even if an admin read them in Galaxy.
-since=$(jq -rn '[inputs | .created_at] | min // empty' "$work/artifacts.jsonl")
+since=$(jq -rn '[inputs | select(.id) | .created_at] | min // empty' "$work/artifacts.jsonl")
 
 failed=0
 requests emit --handled "$work/handled.txt" ${since:+--seen-since "$since"} "${shed_options[@]}" \

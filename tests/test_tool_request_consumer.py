@@ -194,9 +194,9 @@ def test_emit_keeps_user_text_out_of_markdown(fake_tool_shed):
     assert "@octocat" not in _outside_code(item["body"])
     assert "<b>" not in _outside_code(item["body"])
 
-    # GitHub rejects titles over 256 characters and bodies over 65536.
+    # GitLab rejects titles over 255 characters, and GitHub bodies over 65536.
     long_names = _emit("b2486a20bc56b90f", tools=[{"name": "x" * 255}, {"name": "y" * 255}], shed=FAKE_SHED)
-    assert len(long_names["title"]) <= 256
+    assert len(long_names["title"]) <= 255
 
 
 def test_emit_fits_long_requests_into_the_body_limit(fake_tool_shed):
@@ -468,6 +468,22 @@ def test_render_yaml_adds_revisions_to_existing_entries(tmp_path):
     assert render_yaml() == merged
 
 
+def test_render_yaml_starts_a_tool_list_that_installs_dependencies(tmp_path):
+    items_file = tmp_path / "items.json"
+    items_file.write_text(json.dumps([{"action": "pr", "tools": [{"name": "fastp", "owner": "iuc"}]}]))
+    tools_file = tmp_path / "new.yaml"
+
+    main(["render-yaml", "--items", str(items_file), "--tools-file", str(tools_file), "-o", str(tools_file)])
+
+    # shed-tools only installs dependencies when the tool list asks for them.
+    assert yaml.safe_load(tools_file.read_text()) == {
+        "install_tool_dependencies": False,
+        "install_repository_dependencies": True,
+        "install_resolver_dependencies": True,
+        "tools": [{"name": "fastp", "owner": "iuc"}],
+    }
+
+
 def test_render_yaml_reads_revisions_like_shed_tools():
     existing = {
         "tools": [
@@ -641,9 +657,9 @@ def test_installed_checks_galaxys_repositories(fake_tool_shed):
     assert not installed(galaxy(), _request("b2486a20bc56b90f", [{"name": "Foldseek"}]), FAKE_SHED)
 
 
-def test_reply_waits_for_galaxy_to_send_it_in_a_task():
+def test_reply_waits_for_galaxy_to_send_it_in_a_task(monkeypatch):
     # With Celery, Galaxy answers with a task, and sends the notification in it.
-    states = {"t1": ["PENDING", "SUCCESS"], "t2": ["STARTED", "FAILURE"]}
+    states = {"t1": ["PENDING", "SUCCESS"], "t2": ["STARTED", "FAILURE"], "t3": ["PENDING"] * 3}
     task = SimpleNamespace(id=None)
 
     def get(url, params=None):
@@ -665,3 +681,7 @@ def test_reply_waits_for_galaxy_to_send_it_in_a_task():
     task.id = "t2"
     with pytest.raises(ReplyFailed):
         reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    # A slow Galaxy may still send it, so asking again could repeat the message.
+    monkeypatch.setattr(tool_request_consumer, "REPLY_TIMEOUT", 0)
+    task.id = "t3"
+    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
