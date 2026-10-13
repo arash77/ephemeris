@@ -500,7 +500,7 @@ def merge_tool_list(existing: dict | None, items: list[dict]) -> dict:
     ``changeset_revision`` pin that gains revisions becomes a ``revisions`` list.
     """
     # shed-tools only installs the dependencies of tools when the tool list asks for them.
-    merged = dict(existing) if existing is not None else dict(NEW_TOOL_LIST)
+    merged: dict = dict(existing) if existing is not None else dict(NEW_TOOL_LIST)
     tools = [dict(t) for t in merged.get("tools") or []]
     by_repository: dict[tuple[str, str, str], list[dict]] = {}
     for tool in tools:
