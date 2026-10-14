@@ -16,12 +16,14 @@ Running it on a schedule
 
 Galaxy sends tool installation requests to its admins when
 ``enable_tool_installation_request_form`` and ``enable_notification_system``
-are both enabled. The script below checks for new requests, opens an issue or
-a pull request (a merge request on GitLab) for each of them in your tool list
-repository, and tells the requester where it is handled. It works with any
-Galaxy server, on GitHub and GitLab, from any CI system or cron job that runs
-it in a clean checkout of the repository, on the branch that pull requests go
-to. Its first lines list what it needs and the variables it reads.
+are both enabled. ``consume-tool-installation-requests run`` runs a script that
+comes with ephemeris, shown below. It checks for new requests, opens an issue
+or a pull request (a merge request on GitLab) for each of them in your tool
+list repository, and tells the requester where it is handled. It works with
+any Galaxy server, on GitHub and GitLab, from any CI system or cron job that
+runs it in a clean checkout of the repository, on the branch that pull
+requests go to. The script's first lines list what it needs and the
+environment variables it reads.
 
 What pull requests change depends on how your repository lists its tools:
 
@@ -42,8 +44,7 @@ the request becomes an issue.
 
 On GitHub:
 
-- copy ``tool-installation-requests.sh`` to ``.github/`` and the workflow
-  below to ``.github/workflows/``,
+- copy the workflow below to ``.github/workflows/``,
 - set ``EPHEMERIS_GALAXY`` to your Galaxy server, and ``TOOLS_FILE`` or
   ``APPLY_COMMAND`` as above,
 - add the API key of an admin account as the ``GALAXY_ADMIN_API_KEY``
@@ -60,8 +61,7 @@ requests.
 
 On GitLab:
 
-- copy ``tool-installation-requests.sh`` next to ``.gitlab-ci.yml``, and add
-  the jobs below to ``.gitlab-ci.yml``,
+- add the jobs below to ``.gitlab-ci.yml``,
 - set ``EPHEMERIS_GALAXY``, and ``TOOLS_FILE`` or ``APPLY_COMMAND``. GitLab
   expands variables in ``variables:``, so write ``$ITEM`` as ``$$ITEM`` there,
 - add the API key of an admin account as the masked ``EPHEMERIS_API_KEY``
@@ -147,7 +147,7 @@ code, so that it cannot mention people. They do not contain the requester's
 email address, but what users typed is public in a public repository, so use a
 private one if your users' requests should stay private.
 
-.. literalinclude:: ../examples/tool-installation-requests.sh
+.. literalinclude:: ../../src/ephemeris/tool_installation_requests.sh
    :language: bash
 
 The GitHub Actions workflow:
@@ -174,8 +174,7 @@ them. For those:
 - GitHub's and GitLab's own machines cannot reach a Galaxy server on a private
   network. Run the jobs on a self-hosted runner there instead, or run the script
   from cron on a machine that can reach both Galaxy and the forge, in a
-  checkout of your tool list repository with ``tool-installation-requests.sh``
-  at its top. Set it up once::
+  checkout of your tool list repository. Set it up once::
 
     python3 -m venv /srv/tool-requests/venv
     /srv/tool-requests/venv/bin/pip install ephemeris
@@ -196,7 +195,7 @@ them. For those:
   and run it every hour from that user's crontab, on the base branch reset
   before each run, never twice at once, and for at most an hour::
 
-    23 * * * * cd /srv/tool-requests/tools && flock -n ../lock timeout 1h sh -c 'git fetch -q && git checkout -qf -B main origin/main && git clean -qfd && set -a && . ../settings && set +a && bash tool-installation-requests.sh'
+    23 * * * * cd /srv/tool-requests/tools && flock -n ../lock timeout 1h sh -c 'git fetch -q && git checkout -qf -B main origin/main && git clean -qfd && set -a && . ../settings && set +a && consume-tool-installation-requests run'
 
 Without a tool list repository, an admin can handle requests by hand: write
 the pull request items to a tool list, review it, install it, and tell the

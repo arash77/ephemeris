@@ -1,9 +1,8 @@
 # Opens an issue or a merge request in this project for each new tool
 # installation request on a Galaxy server, tells the requester where it is
-# handled, and later whether the tools got installed. Needs
-# tool-installation-requests.sh from the ephemeris docs next to .gitlab-ci.yml,
-# and a pipeline schedule. See the consume-tool-installation-requests page of
-# the ephemeris docs.
+# handled, and later whether the tools got installed. Needs a pipeline
+# schedule. See the consume-tool-installation-requests page of the ephemeris
+# docs.
 variables:
   EPHEMERIS_GALAXY: https://galaxy.example.org
   # Leave TOOLS_FILE out to open only issues, or set APPLY_COMMAND for other repository layouts,
@@ -22,7 +21,7 @@ tool-installation-requests:
     - pip install ephemeris
     - git config user.name "Tool installation requests"
     - git config user.email "noreply@$CI_SERVER_HOST"
-    - bash tool-installation-requests.sh
+    - consume-tool-installation-requests run
 
 # Installs the tool list into Galaxy whenever it changes on the default branch,
 # for example when a request's merge request is merged. Leave it out if

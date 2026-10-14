@@ -1,7 +1,9 @@
 import io
 import json
+import os
 import pathlib
 import re
+import sys
 from datetime import (
     datetime,
     timezone,
@@ -13,6 +15,7 @@ from urllib.parse import (
 )
 
 import pytest
+import requests
 import yaml
 from bioblend import ConnectionError as BioblendError
 
@@ -707,3 +710,28 @@ def test_reply_waits_for_galaxy_to_send_it_in_a_task(monkeypatch):
     monkeypatch.setattr(tool_request_consumer, "REPLY_TIMEOUT", -1)
     task.id = "t3"
     assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+
+
+def test_run_starts_the_script_that_comes_with_ephemeris(monkeypatch):
+    started = []
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(tool_request_consumer.os, "execvp", lambda file, args: started.append((file, args)))
+
+    main(["run"])
+
+    [(file, [_, script])] = started
+    assert file == "bash"
+    assert pathlib.Path(script).read_text().startswith("#!/usr/bin/env bash")
+    # The script runs this command, so it finds the one from the same installation first.
+    assert os.environ["PATH"].split(os.pathsep)[0] == os.path.dirname(sys.executable)
+
+
+def test_emit_reports_galaxy_refusing_it(monkeypatch, caplog):
+    def get(url, params=None):
+        raise requests.HTTPError("401 Client Error: Unauthorized")
+
+    gi = SimpleNamespace(url="http://galaxy.test/api", make_get_request=get)
+    monkeypatch.setattr(tool_request_consumer, "get_galaxy_connection", lambda args, log, login_required: gi)
+
+    assert main(["emit"]) == 1
+    assert "Could not read the requests from Galaxy: 401 Client Error" in caplog.text

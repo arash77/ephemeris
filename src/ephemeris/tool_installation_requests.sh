@@ -2,11 +2,12 @@
 # Opens an issue or a pull request in this repository for each new tool
 # installation request on a Galaxy server, and tells the requester where it is
 # handled. Once the issue or pull request is closed, it tells them whether the
-# tools got installed. Run it on a schedule, from any CI system or cron, in a
-# clean checkout of the repository, on a machine that can reach Galaxy. See the
-# consume-tool-installation-requests page of the ephemeris docs.
+# tools got installed. Run it on a schedule with `consume-tool-installation-requests
+# run`, from any CI system or cron, in a clean checkout of the repository, on a
+# machine that can reach Galaxy. See the consume-tool-installation-requests page
+# of the ephemeris docs.
 #
-# It needs bash 4.4 or later, git, curl, jq and ephemeris, and reads these variables:
+# It needs bash 4.4 or later, git, curl and jq, and reads these variables:
 #
 # EPHEMERIS_GALAXY   Galaxy server.
 # EPHEMERIS_API_KEY  API key of a Galaxy admin account.

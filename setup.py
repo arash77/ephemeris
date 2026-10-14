@@ -51,6 +51,7 @@ ENTRY_POINTS = """
 
 PACKAGE_DATA = {
     # Be sure to update MANIFEST.in for source dist.
+    "ephemeris": ["tool_installation_requests.sh"],
 }
 PACKAGE_DIR = {
     SOURCE_DIR: SOURCE_DIR,

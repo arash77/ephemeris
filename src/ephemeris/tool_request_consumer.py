@@ -24,6 +24,10 @@ from datetime import (
     timezone,
 )
 from functools import cache
+from importlib.resources import (
+    as_file,
+    files,
+)
 from urllib.parse import quote
 
 import yaml
@@ -628,6 +632,14 @@ def mark_seen(gi, notification_ids: list[str]) -> None:
     )
 
 
+def run_script() -> None:
+    """Replace this process with the script that opens issues and pull requests for requests."""
+    # The script runs this command, so let it find the one from this installation.
+    os.environ["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), os.environ.get("PATH", "")])
+    with as_file(files("ephemeris") / "tool_installation_requests.sh") as script:
+        os.execvp("bash", ["bash", str(script)])
+
+
 def _parser():
     parser = argparse.ArgumentParser(
         description="Turn Galaxy tool installation requests into issues and pull requests for a tool list repository.",
@@ -718,11 +730,19 @@ def _parser():
         help="Mark requests as seen, so that emit skips them.",
     )
     mark_seen.add_argument("notification_ids", nargs="+", metavar="notification_id", help="Requests to mark.")
+
+    subparsers.add_parser(
+        "run",
+        help="Open issues and pull requests for new requests in the checked out tool list repository, and tell "
+        "requesters about them, with the script that comes with ephemeris. Its settings are environment variables.",
+    )
     return parser
 
 
 def main(argv=None):
     args = _parser().parse_args(argv)
+    if args.command == "run":
+        return run_script()
     log = setup_global_logger(__name__, log_file=args.log_file, verbose=args.verbose)
     disable_external_library_logging()
 
@@ -756,7 +776,12 @@ def main(argv=None):
             with open(args.handled) as f:
                 handled = {line.strip() for line in f if line.strip()}
         seen_since = _parse_time(args.seen_since) if args.seen_since else None
-        pending = select_requests(fetch_notifications(gi), handled, seen_since)
+        try:
+            notifications = fetch_notifications(gi)
+        except (BioblendError, OSError) as e:
+            log.error(f"Could not read the requests from Galaxy: {e}")
+            return 1
+        pending = select_requests(notifications, handled, seen_since)
         shed_url = format_tool_shed_url(args.tool_shed_url)
         items = emit(pending, shed_url, args.panel_label, label_map, args.wrapper_request_url, args.pin_latest)
         for item in items:

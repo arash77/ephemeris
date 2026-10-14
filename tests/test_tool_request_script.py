@@ -27,7 +27,7 @@ import yaml
 
 from ephemeris.tool_request_consumer import emit_item
 
-SCRIPT = pathlib.Path(__file__).parent.parent / "docs" / "examples" / "tool-installation-requests.sh"
+SCRIPT = pathlib.Path(__file__).parent.parent / "src" / "ephemeris" / "tool_installation_requests.sh"
 LABEL = "tool installation request"
 ANSWERED = "tool installation request answered"
 TOOLS = """\
