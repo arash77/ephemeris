@@ -25,6 +25,8 @@ from urllib.parse import (
 import pytest
 import yaml
 
+from ephemeris.tool_request_consumer import emit_item
+
 SCRIPT = pathlib.Path(__file__).parent.parent / "docs" / "examples" / "tool-installation-requests.sh"
 LABEL = "tool installation request"
 ANSWERED = "tool installation request answered"
@@ -194,7 +196,9 @@ def forge_server():
 
 
 def _body(notification_id):
-    return f"Tool installation request from Galaxy (notification `{notification_id}`).\n\nDetails."
+    """The body emit gives a request, from which the script reads the notification id."""
+    notification = {"id": notification_id, "content": {"tools": []}}
+    return emit_item(notification, "https://toolshed.g2.bx.psu.edu/", "Tools")["body"]
 
 
 def _item(notification_id, action, title, tools=()):
@@ -300,8 +304,9 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
     # The issue a run opened before it stopped, on the second page of the label's issues.
     for i in range(100):
         forge.add("issue", f"Older request {i}", created_at="2026-09-01T00:00:00Z")
-    # Issues without the label are not the script's.
+    # Issues without the label are not the script's, and labelled ones may be written by hand.
     forge.add("issue", _body("n5"), labels=["question"])
+    forge.add("issue", None)
     reused_issue = forge.add("issue", _body("n2"))["url"]
     # Opened before pull requests got the label.
     reused_change = forge.add("change", _body("n4"), labels=(), branch="tool-request/n4")["url"]
@@ -348,6 +353,7 @@ def test_script_opens_and_reuses_issues_and_pull_requests(tmp_path, forge_server
     new_issues = {i["url"]: i for i in new if i["kind"] == "issue"}
     assert set(new_issues) == {replies["n3"][0], replies["n5"][0]}
     assert all(i["labels"] == [LABEL] for i in new_issues.values())
+    assert new_issues[replies["n5"][0]]["body"] == _body("n5")
     assert [args[1] for args in calls if args[0] == "mark-seen"] == ["n1", "n2", "n3", "n4", "n5"]
 
 
@@ -364,14 +370,24 @@ def test_script_tells_requesters_how_their_request_ended(tmp_path, forge_server,
     # A closed duplicate of an open issue.
     forge.add("issue", _body("c7"), state="closed", closed_at=_ago(1))
     forge.add("issue", _body("c7"))
+    # Closed duplicates are told once, and a merged pull request waits for its tools.
+    forge.add("issue", _body("c8"), state="closed", closed_at=_ago(2))
+    duplicate = forge.add("issue", _body("c8"), state="closed", closed_at=_ago(1))
+    forge.add("issue", _body("c3"), state="closed", closed_at=_ago(1))
+    # Labelled by hand with other capitals, which GitHub's label names ignore.
+    forge.add("issue", _body("c9"), labels=[LABEL, ANSWERED.title()], state="closed", closed_at=_ago(1))
 
     env = dict(_ci(kind, api, tmp_path), TOOLS_FILE="tools.yaml")
     calls = _run(tmp_path, [], env, gitlab_ci=kind == "gitlab", installed=["c2"])
 
-    assert [args[2] for args in calls if args[0] == "installed"] == ["c1", "c2", "c3"]
-    assert _replies(calls) == {"c1": (rejected["url"], "closed"), "c2": (merged["url"], "installed")}
-    answered = [i["body"].split("`")[1] for i in forge.items if ANSWERED in i["labels"]]
-    assert sorted(answered) == ["c1", "c2", "c4"]
+    assert [args[2] for args in calls if args[0] == "installed"] == ["c1", "c2", "c3", "c8"]
+    assert _replies(calls) == {
+        "c1": (rejected["url"], "closed"),
+        "c2": (merged["url"], "installed"),
+        "c8": (duplicate["url"], "closed"),
+    }
+    answered = [i["url"] for i in forge.items if ANSWERED in i["labels"]]
+    assert answered == [rejected["url"], merged["url"], forge.items[3]["url"], duplicate["url"]]
 
 
 def test_script_opens_only_issues_without_a_tool_list(tmp_path, forge_server):
@@ -419,7 +435,6 @@ def test_script_can_add_a_file_per_request(tmp_path, forge_server):
     ).stdout
     # shed-tools installs dependencies only when the tool list asks for them.
     assert yaml.safe_load(added) == {
-        "install_tool_dependencies": False,
         "install_repository_dependencies": True,
         "install_resolver_dependencies": True,
         "tools": [bwa],

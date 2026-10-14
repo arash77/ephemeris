@@ -6,7 +6,7 @@
 # clean checkout of the repository, on a machine that can reach Galaxy. See the
 # consume-tool-installation-requests page of the ephemeris docs.
 #
-# It needs bash, git, curl, jq and ephemeris, and reads these variables:
+# It needs bash 4.4 or later, git, curl, jq and ephemeris, and reads these variables:
 #
 # EPHEMERIS_GALAXY   Galaxy server.
 # EPHEMERIS_API_KEY  API key of a Galaxy admin account.
@@ -18,13 +18,10 @@
 #                    in GitHub Actions and GitLab CI.
 # PUSH_URL           Where to push branches (default: origin, or the project URL
 #                    in GitLab CI, whose origin only allows fetching).
-# BASE_BRANCH        Branch that pull requests go to (default: the checked out one).
 # TOOLS_FILE         Tool list that pull requests add tools to.
 # APPLY_COMMAND      Shell command that adds the tools of the work item in the file
 #                    $ITEM to the checkout, for repositories that are not a single
 #                    tool list. Defaults to render-yaml into TOOLS_FILE.
-# TOOL_SHED_URL      Tool Shed to look requested tools up on, and to check installed
-#                    tools against (default: the main one).
 # EMIT_OPTIONS       More options for emit, written as in a shell, for example
 #                    --panel-label 'Other Tools' --pin-latest.
 # REQUEST_LABEL      Label of the issues and pull requests opened here
@@ -32,7 +29,8 @@
 # ANSWERED_LABEL     Label added once the requester got told how their request
 #                    ended (default: tool installation request answered).
 #
-# Without TOOLS_FILE or APPLY_COMMAND, every request becomes an issue.
+# Without TOOLS_FILE or APPLY_COMMAND, every request becomes an issue. Pull
+# requests go to the checked out branch.
 set -euo pipefail
 
 if [ -z "${FORGE:-}" ]; then
@@ -46,7 +44,6 @@ case "${FORGE:-}" in
 github)
     FORGE_API=${FORGE_API:-${GITHUB_API_URL:-https://api.github.com}}
     FORGE_PROJECT=${FORGE_PROJECT:-${GITHUB_REPOSITORY:-}}
-    PUSH_URL=${PUSH_URL:-origin}
     git_user=x-access-token
     ;;
 gitlab)
@@ -54,14 +51,10 @@ gitlab)
     FORGE_PROJECT=${FORGE_PROJECT:-${CI_PROJECT_ID:-}}
     git_user=oauth2
     if [ -z "${PUSH_URL:-}" ] && [ -n "${CI_SERVER_URL:-}" ]; then
-        PUSH_URL="$CI_SERVER_URL/$CI_PROJECT_PATH.git"
         # GitLab CI makes git use the job token, which may not push, for URLs of its server.
         # It leaves a URL that names a user alone, so git asks the credential helper below.
-        case "$PUSH_URL" in
-        http://* | https://*) PUSH_URL="${PUSH_URL/:\/\//://$git_user@}" ;;
-        esac
+        PUSH_URL="${CI_SERVER_URL/:\/\//://$git_user@}/$CI_PROJECT_PATH.git"
     fi
-    PUSH_URL=${PUSH_URL:-origin}
     ;;
 *)
     echo "Set FORGE to github or gitlab" >&2
@@ -69,8 +62,10 @@ gitlab)
     ;;
 esac
 : "${FORGE_TOKEN:?}" "${FORGE_API:?}" "${FORGE_PROJECT:?}"
-BASE_BRANCH=${BASE_BRANCH:-${CI_COMMIT_BRANCH:-$(git branch --show-current)}}
-: "${BASE_BRANCH:?Set BASE_BRANCH to the branch that pull requests go to}"
+PUSH_URL=${PUSH_URL:-origin}
+# GitLab CI checks out a commit rather than a branch.
+base_branch=${CI_COMMIT_BRANCH:-$(git branch --show-current)}
+: "${base_branch:?Check out the branch that pull requests go to}"
 REQUEST_LABEL=${REQUEST_LABEL:-tool installation request}
 ANSWERED_LABEL=${ANSWERED_LABEL:-tool installation request answered}
 if [ -z "${APPLY_COMMAND:-}" ] && [ -n "${TOOLS_FILE:-}" ]; then
@@ -83,7 +78,6 @@ git_identity=()
 if ! git config user.email > /dev/null; then
     git_identity=(-c "user.name=Tool installation requests" -c "user.email=tool-installation-requests@localhost")
 fi
-shed_options=(${TOOL_SHED_URL:+--tool-shed-url "$TOOL_SHED_URL"})
 emit_options=()
 eval "emit_options=(${EMIT_OPTIONS:-})"
 
@@ -95,7 +89,7 @@ fi
 base=$(git rev-parse HEAD)
 start=$(git symbolic-ref --quiet --short HEAD || echo "$base")
 work=$(mktemp -d)
-# Leave the checkout on the branch it was on, which the next run reads BASE_BRANCH from.
+# Leave the checkout on the branch it was on, which the next run starts from.
 trap 'git checkout --quiet --force "$start"; git clean --quiet --force -d; rm -rf "$work"' EXIT
 
 requests() { consume-tool-installation-requests "$@"; }
@@ -114,7 +108,7 @@ headers() {
 api() {
     local status
     # Headers come from a file, so that the token stays out of the process list.
-    status=$(curl --silent --show-error --output "$work/response.json" --write-out '%{http_code}' \
+    status=$(curl --silent --show-error --max-time 300 --output "$work/response.json" --write-out '%{http_code}' \
         --request "$1" --header @<(headers) ${3:+--data-binary "@$3"} "$FORGE_API/$project$2") || return 1
     # Callers in a subshell read the status from here.
     echo "$status" > "$work/status"
@@ -138,7 +132,7 @@ list() {
 # Turns an issue or pull request into {url, number, kind, state, labels, created_at, closed_at, id}.
 # shellcheck disable=SC2016 # a jq expression
 artifact='{url, number, kind, state, labels, created_at, closed_at,
-    id: ((.body // "" | split("\n")[0] | capture("notification `(?<id>[^`]+)`") | .id) // null)}'
+    id: ((.body // "" | split("\n")[0] // "" | capture("notification `(?<id>[^`]+)`") | .id) // null)}'
 
 if [ "$FORGE" = github ]; then
     project="repos/$FORGE_PROJECT"
@@ -161,12 +155,12 @@ if [ "$FORGE" = github ]; then
 
     # add_label KIND NUMBER LABEL
     add_label() {
-        jq -n --arg label "$3" '{labels: [$label]}' > "$work/label-payload.json"
+        jq -n --arg name "$3" '{labels: [$name]}' > "$work/label-payload.json"
         api POST "/issues/$2/labels" "$work/label-payload.json" > /dev/null
     }
 
     open_change() {
-        jq -n --arg head "$1" --arg base "$BASE_BRANCH" --arg title "$2" --rawfile body "$work/body.md" \
+        jq -n --arg head "$1" --arg base "$base_branch" --arg title "$2" --rawfile body "$work/body.md" \
             '{$head, $base, $title, $body}' > "$work/payload.json"
         api POST /pulls "$work/payload.json" > "$work/change.json" || return 1
         # A later run labels it if this fails, when it finds the pull request by its branch.
@@ -175,8 +169,8 @@ if [ "$FORGE" = github ]; then
     }
 
     open_issue() {
-        jq -n --arg title "$1" --rawfile body "$work/body.md" --arg label "$REQUEST_LABEL" \
-            '{$title, $body, labels: [$label]}' > "$work/payload.json"
+        jq -n --arg title "$1" --rawfile body "$work/body.md" --arg name "$REQUEST_LABEL" \
+            '{$title, $body, labels: [$name]}' > "$work/payload.json"
         api POST /issues "$work/payload.json" | jq -r .html_url
     }
 else
@@ -208,7 +202,7 @@ else
     }
 
     open_change() {
-        jq -n --arg source_branch "$1" --arg target_branch "$BASE_BRANCH" --arg title "$2" \
+        jq -n --arg source_branch "$1" --arg target_branch "$base_branch" --arg title "$2" \
             --rawfile description "$work/body.md" --arg labels "$REQUEST_LABEL" \
             '{$source_branch, $target_branch, $title, $description, $labels, remove_source_branch: true}' \
             > "$work/payload.json"
@@ -232,10 +226,9 @@ push() {
 # Opens an issue or a pull request for the work item, unless an earlier run did, and tells the requester.
 handle() {
     local id action title branch url found number
-    jq -r .body "$work/item.json" > "$work/body.md"
-    id=$(jq -r .notification_id "$work/item.json")
-    action=$(jq -r .action "$work/item.json")
-    title=$(jq -r .title "$work/item.json")
+    # Without the newline that jq -r adds, which a body at GitHub's limit has no room for.
+    jq -j .body "$work/item.json" > "$work/body.md"
+    { read -r id; read -r action; read -r title; } < <(jq -r '.notification_id, .action, .title' "$work/item.json")
     branch="tool-request/$id"
     # Reuse what an earlier run opened, also if the request turned from an issue into a pull request since.
     url=$(jq -rn --arg id "$id" 'first(inputs | select(.id == $id) | .url) // empty' "$work/artifacts.jsonl")
@@ -251,17 +244,14 @@ handle() {
         git switch --quiet -C "$branch" "$base" || return 1
         ITEM="$work/item.json" bash -eo pipefail -c "$APPLY_COMMAND" || return 1
         git add --all || return 1
-        if git diff --cached --quiet; then
-            # The repository has these tools already, so let an admin look at the request.
-            action=issue
-        else
+        # Without changes, the repository has these tools already, so an admin looks at the request in an issue.
+        if ! git diff --cached --quiet; then
             git "${git_identity[@]}" commit --quiet --message "$title" || return 1
             push "$branch" || return 1
             if ! url=$(open_change "$branch" "$title"); then
                 # For example, GitHub Actions may not be allowed to open pull requests.
                 [ "$(cat "$work/status")" = 403 ] || return 1
                 echo "Not allowed to open a pull request for $id, so opening an issue" >&2
-                url=""
             fi
         fi
     fi
@@ -274,12 +264,9 @@ handle() {
 # Tells the requester whether the tools of a closed issue or pull request got installed.
 tell_outcome() {
     local id url number kind state answer
-    id=$(jq -r .id "$work/artifact.json")
-    url=$(jq -r .url "$work/artifact.json")
-    number=$(jq -r .number "$work/artifact.json")
-    kind=$(jq -r .kind "$work/artifact.json")
-    state=$(jq -r .state "$work/artifact.json")
-    answer=$(requests installed --notification-id "$id" "${shed_options[@]}") || return 1
+    { read -r id; read -r url; read -r number; read -r kind; read -r state; } \
+        < <(jq -r '.id, .url, .number, .kind, .state' "$work/artifact.json")
+    answer=$(requests installed --notification-id "$id") || return 1
     if [ "$answer" = yes ]; then
         state=installed
     elif [ "$state" = merged ]; then
@@ -298,7 +285,7 @@ for label in "$REQUEST_LABEL" "$ANSWERED_LABEL"; do
     api POST /labels "$work/label.json" > /dev/null 2>&1 || true
 done
 
-# Listing by label, unlike searching, sees what was opened moments ago.
+# Listing by label, unlike searching, sees what was opened a few seconds ago.
 : > "$work/artifacts.jsonl"
 list_artifacts
 jq -r 'select(.id) | .id' "$work/artifacts.jsonl" > "$work/handled.txt"
@@ -306,25 +293,29 @@ jq -r 'select(.id) | .id' "$work/artifacts.jsonl" > "$work/handled.txt"
 since=$(jq -rn '[inputs | select(.id) | .created_at] | min // empty' "$work/artifacts.jsonl")
 
 failed=0
-requests emit --handled "$work/handled.txt" ${since:+--seen-since "$since"} "${shed_options[@]}" \
-    "${emit_options[@]}" > "$work/requests.json"
-for i in $(seq 0 $(($(jq length "$work/requests.json") - 1))); do
-    jq ".[$i]" "$work/requests.json" > "$work/item.json"
+# EMIT_OPTIONS come last, so that a --seen-since there wins.
+requests emit --handled "$work/handled.txt" ${since:+--seen-since "$since"} "${emit_options[@]}" |
+    jq -c '.[]' > "$work/requests.jsonl"
+while read -r line <&3; do
+    printf '%s\n' "$line" > "$work/item.json"
     if ! handle; then
         echo "Request $(jq -r .notification_id "$work/item.json") failed, the next run tries again" >&2
         failed=1
     fi
     git switch --quiet --discard-changes --detach "$base"
     git clean --quiet --force -d
-done
+done 3< "$work/requests.jsonl"
 
-# Look at what was closed in the last 30 days, so that pull requests whose tools never get installed
-# are not looked up forever.
-# A request that still has an open one, like the original of a closed duplicate, is not over yet.
+# Tell each request's outcome once, from a merged pull request if it has one, else from what was closed last.
+# A request that still has an open issue or pull request is not over yet. Only look at what was closed in the
+# last 30 days, so that pull requests whose tools never get installed are not looked up forever. GitHub's label
+# names ignore case.
 jq -c -s --arg answered "$ANSWERED_LABEL" --arg since "$(jq -rn 'now - 30 * 86400 | todate')" '
-    [.[] | select(.state == "open") | .id] as $open | .[]
-    | select(.id and .state != "open" and (.closed_at // "") >= $since and (.labels | index($answered) | not))
-    | select(.id as $id | $open | index($id) | not)' \
+    group_by(.id)[]
+    | select(.[0].id and all(.[]; .state != "open")
+        and ([.[].labels[] | ascii_downcase] | index($answered | ascii_downcase) | not))
+    | (map(select(.state == "merged")) | max_by(.closed_at)) // max_by(.closed_at)
+    | select((.closed_at // "") >= $since)' \
     "$work/artifacts.jsonl" > "$work/closed.jsonl"
 while read -r line <&3; do
     printf '%s\n' "$line" > "$work/artifact.json"
