@@ -6,7 +6,8 @@
 # the ephemeris docs.
 variables:
   EPHEMERIS_GALAXY: https://galaxy.example.org
-  # Leave TOOLS_FILE out to open only issues, or set APPLY_COMMAND for other repository layouts.
+  # Leave TOOLS_FILE out to open only issues, or set APPLY_COMMAND for other repository layouts,
+  # writing $ITEM as $$ITEM, since GitLab expands variables here.
   TOOLS_FILE: requested_tools.yaml
   # EPHEMERIS_API_KEY and FORGE_TOKEN come from masked CI/CD variables.
 
