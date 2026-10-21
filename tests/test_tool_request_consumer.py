@@ -1,16 +1,7 @@
 import io
 import json
 import pathlib
-import re
-from datetime import (
-    datetime,
-    timezone,
-)
 from types import SimpleNamespace
-from urllib.parse import (
-    parse_qs,
-    urlsplit,
-)
 
 import pytest
 import requests
@@ -25,7 +16,6 @@ from ephemeris.tool_request_consumer import (
     fetch_notifications,
     installed,
     main,
-    MAX_BODY_LENGTH,
     merge_tool_list,
     reply,
     ReplyFailed,
@@ -54,11 +44,6 @@ def _galaxy_get(url, params=None):
     return SimpleNamespace(
         status_code=200 if notification else 404, json=lambda: notification, raise_for_status=lambda: None
     )
-
-
-def _outside_code(markdown):
-    without_blocks = re.sub(r"^(`{3,})\n.*?\n\1$", "", markdown, flags=re.S | re.M)
-    return re.sub(r"`[^`\n]*`", "", without_blocks)
 
 
 def _render_yaml(monkeypatch, items, tools_file):
@@ -143,18 +128,27 @@ def fake_tool_shed(monkeypatch):
     clear_caches()
 
 
+FASTP_ID = "toolshed.g2.bx.psu.edu/repos/iuc/fastp/fastp/1.3.6+galaxy0"
+
+
 def test_emit_pins_requested_versions_in_a_pr():
     form = _emit("b2486a20bc56b90f")
-    assert form["action"] == "pr"
-    assert form["tools"] == [
-        {
-            "name": "fastp",
-            "owner": "iuc",
-            "tool_shed_url": SHED,
-            "tool_panel_section_label": LABEL,
-            "revisions": ["68386e630362"],
-        }
-    ]
+    assert form == {
+        "notification_id": "b2486a20bc56b90f",
+        "action": "pr",
+        "tools": [
+            {
+                "name": "fastp",
+                "owner": "iuc",
+                "tool_shed_url": SHED,
+                "tool_panel_section_label": LABEL,
+                "revisions": ["68386e630362"],
+            }
+        ],
+        # The ids Galaxy gives the requested tools, so that installed can check them.
+        "tool_ids": [FASTP_ID],
+        "unresolved": [],
+    }
     assert "toolrequester@galaxy.test" not in json.dumps(form)
 
     workflow = _emit("0aab0e4c25198ad8")
@@ -162,6 +156,10 @@ def test_emit_pins_requested_versions_in_a_pr():
     assert [(t["owner"], t["name"], t["revisions"]) for t in workflow["tools"]] == [
         ("jjohnson", "regex_find_replace", ["9ea374bb0350"]),
         ("kellrott", "regex_replace", ["9a77d5fca67c"]),
+    ]
+    assert workflow["tool_ids"] == [
+        "toolshed.g2.bx.psu.edu/repos/jjohnson/regex_find_replace/regexColumn1/0.1.0",
+        "toolshed.g2.bx.psu.edu/repos/kellrott/regex_replace/regex_replace/1.0.0",
     ]
 
     # Two tools from one repository become one entry, each pinned to the newest revision with its version.
@@ -173,13 +171,13 @@ def test_emit_pins_requested_versions_in_a_pr():
     # A free-text request means the version of the tool named like the repository, not of bwa_mem.
     by_name = _emit("b2486a20bc56b90f", tools=[{"name": "BWA", "requested_version": "0.7.18"}])
     assert by_name["tools"][0]["revisions"] == ["4a196b9c72c2"]
-    assert by_name["title"] == "Install bwa 0.7.18"
+    assert by_name["tool_ids"] == ["toolshed.g2.bx.psu.edu/repos/devteam/bwa/bwa/0.7.18"]
 
 
 def test_emit_falls_back_to_an_issue():
     unavailable = _emit("d413a19dec13d11e")
     assert unavailable["action"] == "issue"
-    assert "| `bwa 0.7.17` | not resolved: `no installable revision has version 0.7.17` | |" in unavailable["body"]
+    assert unavailable["unresolved"] == ["bwa 0.7.17: no installable revision has version 0.7.17"]
 
     unknown = _emit("b887d74393f85b6d")
     assert unknown["action"] == "issue"
@@ -191,6 +189,7 @@ def test_emit_falls_back_to_an_issue():
     assert unpinned["tools"] == [
         {"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "tool_panel_section_label": LABEL}
     ]
+    assert unpinned["tool_ids"] == []
 
     workflow_without_version = _emit(
         "0aab0e4c25198ad8",
@@ -205,71 +204,28 @@ def test_emit_falls_back_to_an_issue():
     assert missing_repository["action"] == "issue"
     assert missing_repository["tools"] == []
 
-    # Another Tool Shed than the configured one is not trusted.
-    other_tool_shed = _emit(
+    # Another Tool Shed than the configured one is not trusted, also if it is disguised.
+    for tool_shed_id in (
+        "testtoolshed.g2.bx.psu.edu/repos/iuc/fastp",
+        "Fixes #1 @victim x://toolshed.g2.bx.psu.edu/repos/iuc/fastp",
+    ):
+        other = _emit(
+            "0aab0e4c25198ad8",
+            tools=[{"name": "fastp", "tool_shed_id": tool_shed_id, "requested_version": "1.3.6+galaxy0"}],
+        )
+        assert other["action"] == "issue"
+        assert other["tools"] == []
+    by_id = _emit(
         "0aab0e4c25198ad8",
         tools=[
             {
                 "name": "fastp",
-                "tool_shed_id": "testtoolshed.g2.bx.psu.edu/repos/iuc/fastp",
+                "tool_shed_id": "http://ToolShed.G2.bx.psu.edu/repos/iuc/fastp",
                 "requested_version": "1.3.6+galaxy0",
             }
         ],
     )
-    assert other_tool_shed["action"] == "issue"
-    assert other_tool_shed["tools"] == []
-
-
-def test_emit_keeps_user_text_out_of_markdown(fake_tool_shed):
-    fake_tool_shed()
-    item = _emit(
-        "b2486a20bc56b90f",
-        tools=[
-            {"name": "@octocat | <b>x</b>"},
-            {"name": "x", "tool_shed_id": "toolshed.g2.bx.psu.edu/repos/@octocat/<b>x|y</b>"},
-        ],
-    )
-    assert "@octocat" not in _outside_code(item["body"])
-    assert "<b>" not in _outside_code(item["body"])
-
-    # GitLab closes issues that a merge request description references, even in code.
-    referencing = _emit(
-        "b2486a20bc56b90f",
-        tools=[{"name": "fastp", "requested_version": "1.3.6+galaxy0", "description": "fixes #3"}],
-    )
-    referencing_request = _request("b2486a20bc56b90f")
-    referencing_request["content"] = dict(referencing_request["content"], additional_remarks="closes #4")
-    for body in (referencing["body"], emit_item(referencing_request, SHED, LABEL)["body"]):
-        assert not re.search(r"#\d", body)
-
-    # Galaxy replaces the workflow id with its own, but older or other servers may pass on what users sent.
-    workflow_request = _request("0aab0e4c25198ad8")
-    assert "Needed by workflow `33b43b4e7093c91f`." in emit_item(workflow_request, SHED, LABEL)["body"]
-    workflow_request["content"] = dict(workflow_request["content"], workflow_id="x` @octocat fixes #1 <b>x</b> `")
-    workflow_body = emit_item(workflow_request, SHED, LABEL)["body"]
-    assert "@octocat" not in _outside_code(workflow_body)
-    assert "<b>" not in _outside_code(workflow_body)
-    assert not re.search(r"#\d", workflow_body)
-
-    # GitLab rejects titles over 255 characters, and GitHub bodies over 65536.
-    long_names = _emit("b2486a20bc56b90f", tools=[{"name": "x" * 255}, {"name": "y" * 255}])
-    assert len(long_names["title"]) <= 255
-
-
-def test_emit_fits_long_requests_into_the_body_limit(fake_tool_shed):
-    fake_tool_shed()
-    # The largest request Galaxy accepts: 50 tools with long URLs and descriptions.
-    unnamed = {"tool_url": "https://x.org/ @victim " + "u" * 2000, "description": "d @victim " * 500}
-    pinned = {"name": "fastp", "requested_version": "1.3.6+galaxy0", "description": "d" * 5000}
-    item = _emit("b2486a20bc56b90f", tools=[unnamed] * 30 + [pinned] * 20)
-
-    assert len(item["body"]) <= MAX_BODY_LENGTH
-    assert "(Truncated, the full request is in Galaxy.)" in item["body"]
-    assert "@victim" not in _outside_code(item["body"])
-    # The tool list entries come last, whole.
-    entries = item["body"].rsplit("Tool list entries:\n```\n", 1)[1]
-    assert entries.endswith("\n```")
-    assert yaml.safe_load(entries[: -len("\n```")])["tools"][0]["revisions"] == ["68386e630362"]
+    assert by_id["action"] == "pr"
 
 
 def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
@@ -292,54 +248,26 @@ def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
             "revisions": ["68386e630362"],
         }
     ]
+    assert item["unresolved"] == [f"bowtie2: map: no repository named bowtie2: map on {SHED}"]
     assert shed.requests == [("fastp", None), ("bowtie2_map", None)]
 
 
-def test_emit_links_tools_no_repository_is_named_like(fake_tool_shed):
-    shed = fake_tool_shed()
-    template = "https://github.com/org/tools-dev/issues/new?title={title}&body={body}&labels=tool%20request"
-    tools = [
-        # The Tool Shed spells this samtools_sort.
-        {"name": "Samtools sort"},
-        {"name": "NewTool @victim", "tool_url": "https://example.org/newtool", "description": "Does (new) things."},
-    ]
-    item = emit_item(_request("b2486a20bc56b90f", tools), SHED, LABEL, wrapper_request_url=template)
-
-    assert ("samtools_sort", None) in shed.requests
-    [(name, link)] = re.findall(r"\[Request a wrapper for `([^`]*)`\]\((\S+)\)", item["body"])
-    assert name == "NewTool @victim"
-    query = parse_qs(urlsplit(link).query)
-    assert query["title"] == ["Tool request: NewTool @victim"]
-    assert "Does (new) things." in query["body"][0]
-    assert "Homepage: https://example.org/newtool" in query["body"][0]
-    assert query["labels"] == ["tool request"]
-    # The link names the tool as code and encodes what users typed.
-    assert "@victim" not in _outside_code(item["body"])
-
-    # Tools the Tool Shed has get no link.
-    listed = emit_item(_request("b2486a20bc56b90f", [{"name": "fastp"}]), SHED, LABEL, wrapper_request_url=template)
-    assert "Request a wrapper" not in listed["body"]
-
-
-def test_emit_pins_tools_without_a_version_to_the_newest_revision(fake_tool_shed):
-    fake_tool_shed()
+def test_emit_pins_tools_without_a_version_to_the_newest_revision():
     by_name = emit_item(_request("b2486a20bc56b90f", [{"name": "fastp"}]), SHED, LABEL, pin_latest=True)
     assert by_name["action"] == "pr"
     assert by_name["tools"][0]["revisions"] == ["68386e630362"]
-    # The tools of a repository can have different versions, so only a named tool's version goes in the title.
-    assert by_name["title"] == "Install fastp"
+    assert by_name["tool_ids"] == [FASTP_ID]
 
     workflow_tool = {"name": "fastp", "tool_shed_id": "toolshed.g2.bx.psu.edu/repos/iuc/fastp"}
     by_id = emit_item(_request("0aab0e4c25198ad8", [workflow_tool]), SHED, LABEL, pin_latest=True)
-    assert by_id["title"] == "Install fastp 1.3.6+galaxy0"
+    assert by_id["tool_ids"] == [FASTP_ID]
 
 
-def test_emit_leaves_versions_of_suites_to_the_admins(fake_tool_shed):
-    fake_tool_shed()
+def test_emit_leaves_versions_of_suites_to_the_admins():
     # Any tool of the suite could have the requested version.
     suite = _emit("b2486a20bc56b90f", tools=[{"name": "bedtools", "requested_version": "2.31.1+galaxy0"}])
     assert suite["action"] == "issue"
-    assert "bedtools has several tools" in suite["body"]
+    assert "bedtools has several tools" in suite["unresolved"][0]
     nameless_tool = {
         "name": None,
         "tool_shed_id": "toolshed.g2.bx.psu.edu/repos/iuc/bedtools",
@@ -361,10 +289,10 @@ def test_emit_leaves_versions_of_suites_to_the_admins(fake_tool_shed):
     # Without a version, the newest revision has every tool of the suite.
     latest = emit_item(_request("b2486a20bc56b90f", [{"name": "bedtools"}]), SHED, LABEL, pin_latest=True)
     assert latest["action"] == "pr"
+    assert len(latest["tool_ids"]) > 1
 
 
-def test_emit_gives_unpinned_tools_their_own_entry(fake_tool_shed):
-    fake_tool_shed()
+def test_emit_gives_unpinned_tools_their_own_entry():
     item = _emit(
         "b2486a20bc56b90f",
         tools=[{"name": "fastp", "requested_version": "1.3.6+galaxy0"}, {"name": "fastp"}],
@@ -374,67 +302,21 @@ def test_emit_gives_unpinned_tools_their_own_entry(fake_tool_shed):
     assert item["tools"] == [dict(entry, revisions=["68386e630362"]), entry]
 
 
-def test_emit_waits_a_day_for_the_tool_shed(fake_tool_shed):
-    now = datetime.now(timezone.utc).isoformat()
-    fresh = _request("b2486a20bc56b90f", id="fresh", publication_time=now)
-    also_fresh = _request("b2486a20bc56b90f", id="also_fresh", publication_time=now)
-    old = _request("b2486a20bc56b90f", id="old", publication_time="2026-01-01T00:00:00")
+def test_emit_leaves_requests_the_tool_shed_fails_on_for_the_next_run(fake_tool_shed):
+    first = _request("b2486a20bc56b90f", id="first")
+    second = _request("b2486a20bc56b90f", id="second")
 
-    # Any error, even one the Tool Shed may give again, leaves fresh requests for the next run.
-    for status in (403, 502):
-        shed = fake_tool_shed(error=BioblendError(f"GET: error {status}", status_code=status))
-        [item] = emit([fresh, old], SHED, LABEL)
-        assert item["notification_id"] == "old"
-        assert item["action"] == "issue"
-        assert f"not looked up, the Tool Shed failed: GET: error {status}" in item["body"]
+    # An error or a slow answer only skips the request it was for.
+    for error in (BioblendError("GET: error 502", status_code=502), requests.ReadTimeout("read timed out")):
+        shed = fake_tool_shed(error=error)
+        assert emit([first, second], SHED, LABEL) == []
         assert len(shed.requests) == 2
 
-    # A Tool Shed that does not answer at all is not asked again in the same run, and the requests after
-    # the one that failed wait, however old they are.
-    shed = fake_tool_shed(error=BioblendError("Connection refused"))
-    assert [i["notification_id"] for i in emit([old, fresh, also_fresh], SHED, LABEL)] == ["old"]
-    assert emit([fresh, old], SHED, LABEL) == []
-    assert len(shed.requests) == 2
-    assert _shed("https://toolshed.invalid/").timeout == tool_request_consumer.TOOL_SHED_TIMEOUT
-
-
-def test_emit_titles_pull_requests_with_tool_shed_data_only(fake_tool_shed):
-    fake_tool_shed()
-    # Only text after the last "://" used to be compared with the configured Tool Shed.
-    disguised = _emit(
-        "0aab0e4c25198ad8",
-        tools=[
-            {
-                "name": None,
-                "tool_shed_id": "Fixes #1 @victim x://toolshed.g2.bx.psu.edu/repos/iuc/fastp",
-                "requested_version": "1.3.6+galaxy0",
-            }
-        ],
-    )
-    assert disguised["action"] == "issue"
-    assert disguised["tools"] == []
-
-    by_id = _emit(
-        "0aab0e4c25198ad8",
-        tools=[
-            {
-                "name": None,
-                "tool_shed_id": "http://ToolShed.G2.bx.psu.edu/repos/iuc/fastp",
-                "requested_version": "1.3.6+galaxy0",
-            }
-        ],
-    )
-    assert by_id["action"] == "pr"
-    assert by_id["title"] == "Install fastp 1.3.6+galaxy0"
-
-    by_name = _emit("b2486a20bc56b90f", tools=[{"name": "FASTP", "requested_version": "1.3.6+galaxy0"}])
-    assert by_name["action"] == "pr"
-    assert by_name["title"] == "Install fastp 1.3.6+galaxy0"
-
-    # Issue titles keep what users typed, on one line.
-    multiline = _emit("b2486a20bc56b90f", tools=[{"name": "fast\np\n\nFixes #1"}])
-    assert multiline["action"] == "issue"
-    assert multiline["title"] == "Install fast p Fixes #1"
+    # A Tool Shed that cannot be reached is not asked again in the same run.
+    shed = fake_tool_shed(error=requests.ConnectionError("Connection refused"))
+    assert emit([first, second], SHED, LABEL) == []
+    assert len(shed.requests) == 1
+    assert _shed("https://toolshed.invalid/").timeout == tool_request_consumer.TIMEOUT
 
 
 def test_select_requests_skips_seen_requests_and_other_categories():
@@ -457,7 +339,7 @@ def test_fetch_notifications_reads_all_at_once():
     assert fetch_notifications(gi) == notifications
 
 
-def test_render_yaml_adds_revisions_to_existing_entries(tmp_path, monkeypatch):
+def test_render_yaml_adds_revisions_to_existing_entries(tmp_path, monkeypatch, capsys):
     existing = {
         "install_tool_dependencies": True,
         "tools": [
@@ -480,22 +362,30 @@ def test_render_yaml_adds_revisions_to_existing_entries(tmp_path, monkeypatch):
     }
     items = [
         {
+            "notification_id": "n1",
             "action": "pr",
             "tools": [{"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}],
         },
-        {"action": "pr", "tools": [new_entry]},
+        {"notification_id": "n2", "action": "pr", "tools": [new_entry]},
         {
+            "notification_id": "n3",
             "action": "pr",
             "tools": [{"name": "regex_find_replace", "owner": "jjohnson", "revisions": ["9ea374bb0350"]}],
         },
         # Issue items wait for the admins.
-        {"action": "issue", "tools": [{"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}]},
+        {
+            "notification_id": "n4",
+            "action": "issue",
+            "tools": [{"name": "bwa", "owner": "devteam", "revisions": ["4a196b9c72c2"]}],
+        },
     ]
 
     tools_file = tmp_path / "tools.yaml"
     tools_file.write_text(yaml.safe_dump(existing))
 
     merged = _render_yaml(monkeypatch, items, tools_file)
+    # It names the requests whose tools it added, so that only their requesters are told.
+    assert capsys.readouterr().out.split() == ["n1", "n2"]
 
     assert merged == {
         "install_tool_dependencies": True,
@@ -511,10 +401,19 @@ def test_render_yaml_adds_revisions_to_existing_entries(tmp_path, monkeypatch):
         ],
     }
     assert _render_yaml(monkeypatch, items, tools_file) == merged
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("tools", ["", "# Requested tools\n", "tools:\n", "install_resolver_dependencies: true\r\n"])
+def test_render_yaml_leaves_a_tool_list_alone_without_new_tools(tmp_path, monkeypatch, tools):
+    tools_file = tmp_path / "tools.yaml"
+    tools_file.write_bytes(tools.encode())
+    _render_yaml(monkeypatch, [], tools_file)
+    assert tools_file.read_bytes() == tools.encode()
 
 
 def test_render_yaml_starts_a_tool_list_that_installs_dependencies(tmp_path, monkeypatch):
-    items = [{"action": "pr", "tools": [{"name": "fastp", "owner": "iuc"}]}]
+    items = [{"notification_id": "n1", "action": "pr", "tools": [{"name": "fastp", "owner": "iuc"}]}]
 
     # shed-tools only installs dependencies when the tool list asks for them.
     assert _render_yaml(monkeypatch, items, tmp_path / "new.yaml") == {
@@ -537,6 +436,7 @@ def test_render_yaml_reads_revisions_like_shed_tools():
     }
     items = [
         {
+            "notification_id": "n1",
             "action": "pr",
             "tools": [
                 {"name": "null_revisions", "owner": "o", "revisions": ["68386e630362"]},
@@ -547,7 +447,7 @@ def test_render_yaml_reads_revisions_like_shed_tools():
         }
     ]
 
-    assert merge_tool_list(existing, items)["tools"] == [
+    assert merge_tool_list(existing, items)[0]["tools"] == [
         {"name": "null_revisions", "owner": "o", "revisions": None},
         {"name": "no_revisions", "owner": "o", "revisions": []},
         {"name": "changeset_pin", "owner": "o", "revisions": ["36be11c58dac", "68386e630362"]},
@@ -572,6 +472,7 @@ tools:
     tools_file.write_text(tools)
     items = [
         {
+            "notification_id": "n1",
             "action": "pr",
             "tools": [{"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}],
         }
@@ -601,7 +502,7 @@ def test_reply_notifies_the_exact_requester():
         make_post_request=post,
     )
 
-    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    assert reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/pull/7")
 
     [(url, payload)] = posted
     assert url == "http://galaxy.test/api/notifications"
@@ -612,12 +513,20 @@ def test_reply_notifies_the_exact_requester():
     assert "https://github.com/org/tools/pull/7" in payload["notification"]["content"]["message"]
 
     # A requester whose account is gone cannot be answered, which must not stop the run.
-    assert not reply(gi, "b887d74393f85b6d", "https://github.com/org/tools/issues/8")
+    assert not reply(gi, ["b887d74393f85b6d"], "https://github.com/org/tools/issues/8")
     assert len(posted) == 1
+
+    # Several requests, also from the same requester, get one notification, which counts once against Galaxy's
+    # limit of notifications per minute.
+    assert reply(
+        gi, ["b2486a20bc56b90f", "0aab0e4c25198ad8", "b887d74393f85b6d"], "https://github.com/org/tools/pull/7"
+    )
+    assert len(posted) == 2
+    assert posted[-1][1]["recipients"]["user_ids"] == ["u2"]
 
     # Galaxy sends nothing to users who turned message notifications off.
     sent.count = 0
-    assert not reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    assert not reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/pull/7")
 
 
 def test_reply_reports_galaxy_refusing_it(monkeypatch, caplog):
@@ -633,8 +542,8 @@ def test_reply_reports_galaxy_refusing_it(monkeypatch, caplog):
     monkeypatch.setattr(tool_request_consumer, "get_galaxy_connection", lambda args, log, login_required: gi)
 
     # Galaxy limits how many notifications an account sends per minute, so the next run tries again.
-    assert main(["reply", "--notification-id", "b2486a20bc56b90f", "--url", "https://github.com/org/tools/pull/7"]) == 1
-    assert "Could not tell the requester of b2486a20bc56b90f" in caplog.text
+    assert main(["reply", "b2486a20bc56b90f", "--url", "https://github.com/org/tools/pull/7"]) == 1
+    assert "Could not tell the requesters of b2486a20bc56b90f" in caplog.text
 
 
 def test_reply_tells_how_the_request_ended():
@@ -652,45 +561,41 @@ def test_reply_tells_how_the_request_ended():
     )
 
     # Admins without a tool list repository have no link to give.
-    assert reply(gi, "b2486a20bc56b90f", state="installed")
+    assert reply(gi, ["b2486a20bc56b90f"], state="installed")
     assert posted[-1]["subject"] == "Your requested tools are installed"
     assert "http" not in posted[-1]["message"]
-    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/issues/8", state="closed")
+    assert reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/issues/8", state="closed")
     assert posted[-1]["message"].endswith(": https://github.com/org/tools/issues/8")
     # Galaxy deletes requests some months after they were sent.
-    assert not reply(gi, "0000000000000000", state="closed")
+    assert not reply(gi, ["0000000000000000"], state="closed")
     assert len(posted) == 2
 
 
-def test_installed_checks_the_pinned_revisions():
-    def galaxy(**changes):
-        repository = {
-            "status": "Installed",
-            "deleted": False,
-            "tool_shed": "toolshed.g2.bx.psu.edu",
-            "owner": "iuc",
-            "name": "fastp",
-            "changeset_revision": "68386e630362",
-            "installed_changeset_revision": "68386e630362",
-        }
-        return SimpleNamespace(toolshed=SimpleNamespace(get_repositories=lambda: [dict(repository, **changes)]))
+def test_installed_checks_the_tools_galaxy_loaded():
+    def galaxy(*tool_ids):
+        def get(url, params=None):
+            assert (url, params) == ("http://galaxy.test/api/tools", {"in_panel": False})
+            return SimpleNamespace(
+                json=lambda: [{"id": i} for i in ("upload1", *tool_ids)], raise_for_status=lambda: None
+            )
+
+        return SimpleNamespace(url="http://galaxy.test/api", make_get_request=get)
 
     fastp = {"name": "fastp", "owner": "iuc", "tool_shed_url": SHED, "revisions": ["68386e630362"]}
     items = [
-        {"notification_id": "n1", "action": "pr", "tools": [fastp]},
+        {"notification_id": "n1", "action": "pr", "tools": [fastp], "tool_ids": [FASTP_ID]},
         # Issue items do not pin every tool, so an admin decides.
-        {"notification_id": "n2", "action": "issue", "tools": [fastp]},
+        {"notification_id": "n2", "action": "issue", "tools": [fastp], "tool_ids": [FASTP_ID]},
+        # A revision without tools, such as a suite, cannot be checked.
+        {"notification_id": "n3", "action": "pr", "tools": [fastp], "tool_ids": []},
     ]
 
-    assert installed(galaxy(), items) == ["n1"]
-    # Updated since, the installed revision still counts.
-    assert installed(galaxy(changeset_revision="4990e6f1348f"), items) == ["n1"]
-    older = {"changeset_revision": "36be11c58dac", "installed_changeset_revision": "36be11c58dac"}
-    assert installed(galaxy(**older), items) == []
-    assert installed(galaxy(status="Error"), items) == []
-    # The same repository from another owner or Tool Shed is not the one the request resolved to.
-    assert installed(galaxy(owner="other"), items) == []
-    assert installed(galaxy(tool_shed="other-shed.example.org"), items) == []
+    # The id holds the Tool Shed, owner, repository, tool and version, so another revision with the same version
+    # counts, and the same tool from another owner or Tool Shed does not.
+    assert installed(galaxy(FASTP_ID), items) == ["n1"]
+    assert installed(galaxy(FASTP_ID.replace("galaxy0", "galaxy1")), items) == []
+    assert installed(galaxy(FASTP_ID.replace("/iuc/", "/other/")), items) == []
+    assert installed(galaxy(), items) == []
 
 
 def test_reply_waits_for_galaxy_to_send_it_in_a_task(monkeypatch):
@@ -713,16 +618,16 @@ def test_reply_waits_for_galaxy_to_send_it_in_a_task(monkeypatch):
     )
 
     task.id = "t1"
-    assert reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+    assert reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/pull/7")
     # The request then stays unseen, so that the next run answers it.
     task.id = "t2"
     with pytest.raises(ReplyFailed):
-        reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+        reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/pull/7")
     # Not sent in time counts as not sent, so it is asked again, even if Galaxy may send it later.
     monkeypatch.setattr(tool_request_consumer, "REPLY_TIMEOUT", -1)
     task.id = "t3"
     with pytest.raises(ReplyFailed):
-        reply(gi, "b2486a20bc56b90f", "https://github.com/org/tools/pull/7")
+        reply(gi, ["b2486a20bc56b90f"], "https://github.com/org/tools/pull/7")
 
 
 def test_emit_reports_galaxy_refusing_it(monkeypatch, caplog):

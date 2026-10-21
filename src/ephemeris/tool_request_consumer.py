@@ -17,14 +17,9 @@ import os
 import re
 import sys
 import time
-from datetime import (
-    datetime,
-    timedelta,
-    timezone,
-)
 from functools import cache
-from urllib.parse import quote
 
+import requests
 import yaml
 from bioblend import ConnectionError as BioblendError
 from bioblend.toolshed import ToolShedInstance
@@ -46,19 +41,10 @@ from .ephemeris_log import (
 from .shed_tools_methods import format_tool_shed_url
 
 CATEGORY = "tool_installation_request"
-# GitHub's limit for issue and pull request bodies.
-MAX_BODY_LENGTH = 65536
-# Longest user text shown in table cells and headings.
-MAX_INLINE_LENGTH = 300
-TRUNCATED = "(Truncated, the full request is in Galaxy.)"
-# Longest user text put into a wrapper request link, which browsers and forges limit in length.
-MAX_LINK_TEXT_LENGTH = 500
 DEFAULT_TOOL_SHED = "https://toolshed.g2.bx.psu.edu/"
 DEFAULT_PANEL_LABEL = "Tools from user request"
-# Seconds to wait for each Tool Shed response.
-TOOL_SHED_TIMEOUT = 60
-# How long a request waits for the Tool Shed to answer before it becomes an issue anyway.
-TOOL_SHED_PATIENCE = timedelta(days=1)
+# Seconds to wait for each response from the Tool Shed or Galaxy.
+TIMEOUT = 60
 TOOL_SHED_ERRORS = (BioblendError, OSError, ValueError)
 # Seconds to wait for a Galaxy that sends notifications in a Celery task.
 REPLY_TIMEOUT = 60
@@ -92,20 +78,11 @@ log = logging.getLogger(__name__)
 
 
 class Unresolved(Exception):
-    def __init__(self, message: str, not_on_tool_shed: bool = False):
-        super().__init__(message)
-        # No repository is named like the tool, so it may not be wrapped yet.
-        self.not_on_tool_shed = not_on_tool_shed
+    pass
 
 
 class ReplyFailed(Exception):
     pass
-
-
-def _parse_time(text: str) -> datetime:
-    # Python 3.10 does not read a trailing Z, and Galaxy reports UTC without a time zone.
-    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def select_requests(notifications: list[dict]) -> list[dict]:
@@ -120,7 +97,7 @@ def select_requests(notifications: list[dict]) -> list[dict]:
 @cache
 def _shed(url: str) -> ToolShedInstance:
     shed = ToolShedInstance(url=url)
-    shed.timeout = TOOL_SHED_TIMEOUT
+    shed.timeout = TIMEOUT
     return shed
 
 
@@ -151,7 +128,7 @@ def _find_repository(shed_url: str, name: str | None) -> dict:
     ]
     matches = next((found for found in (_repositories(shed_url, key) for key in keys) if found), [])
     if not matches:
-        raise Unresolved(f"no repository named {name} on {shed_url}", not_on_tool_shed=True)
+        raise Unresolved(f"no repository named {name} on {shed_url}")
     if len(matches) > 1:
         raise Unresolved(
             "several repositories match: " + ", ".join(sorted(f"{r['owner']}/{r['name']}" for r in matches))
@@ -159,11 +136,14 @@ def _find_repository(shed_url: str, name: str | None) -> dict:
     return matches[0]
 
 
-def _find_revision(shed_url: str, repository: dict, version: str | None, tool_id: str | None) -> tuple[str, str | None]:
-    """Return the newest installable revision that ships the requested tool version, and that version.
+def _find_revision(
+    shed_url: str, repository: dict, version: str | None, tool_id: str | None
+) -> tuple[str, list[tuple[str, str]]]:
+    """Return the newest installable revision that ships the requested tool version, and the ids and versions of
+    the tools requested from it.
 
     Without a version, return the newest revision that ships the tool, or the newest
-    revision if no tool is named.
+    revision and all of its tools if no tool is named.
     """
     # Legacy revisions can lack a numeric revision.
     revisions = sorted(
@@ -180,11 +160,12 @@ def _find_revision(shed_url: str, repository: dict, version: str | None, tool_id
         elif len(tool_ids) > 1:
             raise Unresolved(f"{repository['name']} has several tools, so the version does not tell which one")
     for revision in revisions:
+        tools = [(tool["id"], tool["version"]) for tool in revision.get("tools", [])]
         if version is None and tool_id is None:
-            return revision["changeset_revision"], None
-        for tool in revision.get("tools", []):
-            if version in (None, tool["version"]) and tool_id in (None, tool["id"]):
-                return revision["changeset_revision"], tool["version"]
+            return revision["changeset_revision"], tools
+        for found in tools:
+            if version in (None, found[1]) and tool_id in (None, found[0]):
+                return revision["changeset_revision"], [found]
     raise Unresolved(f"no installable revision has version {version}" if version else "no installable revision")
 
 
@@ -196,11 +177,12 @@ def _without_scheme(url: str) -> str:
     return re.sub(r"^https?://", "", url, flags=re.IGNORECASE).rstrip("/").lower()
 
 
-def _resolve(tool: dict, shed_url: str, pin_latest: bool = False) -> tuple[str, str, str | None, str | None]:
-    """Return the owner, repository name, pinned revision and tool version of a requested tool.
+def _resolve(tool: dict, shed_url: str, pin_latest: bool = False) -> tuple[str, str, str | None, list[str]]:
+    """Return the owner, repository name and pinned revision of a requested tool, and the ids Galaxy gives the
+    requested tools of that revision.
 
     All of them are spelled as the Tool Shed does. Without ``pin_latest``, a tool
-    requested without a version is not pinned.
+    requested without a version is not pinned, and has no ids.
     """
     tool_id = None
     if tool.get("tool_shed_id"):
@@ -219,10 +201,12 @@ def _resolve(tool: dict, shed_url: str, pin_latest: bool = False) -> tuple[str, 
         tool_id = tool.get("name")
     else:
         repository = _find_repository(shed_url, tool.get("name"))
-    revision = version = None
-    if tool.get("requested_version") or pin_latest:
-        revision, version = _find_revision(shed_url, repository, tool.get("requested_version"), tool_id)
-    return repository["owner"], repository["name"], revision, version
+    owner, name = repository["owner"], repository["name"]
+    if not (tool.get("requested_version") or pin_latest):
+        return owner, name, None, []
+    revision, tools = _find_revision(shed_url, repository, tool.get("requested_version"), tool_id)
+    # Galaxy ids Tool Shed tools as <shed>/repos/<owner>/<name>/<tool id>/<version>.
+    return owner, name, revision, [f"{_without_scheme(shed_url)}/repos/{owner}/{name}/{i}/{v}" for i, v in tools]
 
 
 def _label(tool: dict) -> str:
@@ -230,96 +214,28 @@ def _label(tool: dict) -> str:
     return " ".join(filter(None, [name, tool.get("requested_version")]))
 
 
-def _without_references(text: str) -> str:
-    """Break issue references in user text, which GitLab closes on merge even when they are in code."""
-    return re.sub(r"#(?=\d)", "#⁠", text)
-
-
-def _code(text: str) -> str:
-    """Render user text as code, so it cannot mention people or inject markup."""
-    text = _without_references(" ".join(text.split()).replace("`", "'").replace("|", "/"))
-    if len(text) > MAX_INLINE_LENGTH:
-        text = text[: MAX_INLINE_LENGTH - 3] + "..."
-    return f"`{text}`"
-
-
-def _code_block(text: str) -> str:
-    fence = "```"
-    while fence in text:
-        fence += "`"
-    return f"{fence}\n{text.rstrip()}\n{fence}"
-
-
-def _wrapper_request_link(template: str, tool: dict) -> str:
-    """Fill a URL template, such as a new issue's, with what the user said about a tool."""
-    name, url, description, domain = (
-        (tool.get(key) or "")[:MAX_LINK_TEXT_LENGTH] for key in ("name", "tool_url", "description", "scientific_domain")
-    )
-    body = "\n\n".join(
-        filter(
-            None,
-            [
-                description,
-                url and f"Homepage: {url}",
-                domain and f"Scientific domain: {domain}",
-                "A Galaxy user asked for this tool in a tool installation request.",
-            ],
-        )
-    )
-    values = {
-        "name": name,
-        "url": url,
-        "description": description,
-        "domain": domain,
-        "title": f"Tool request: {name}",
-        "body": body,
-    }
-    for key, value in values.items():
-        template = template.replace(f"{{{key}}}", quote(value, safe=""))
-    return template
-
-
-def _size(lines: list[str]) -> int:
-    """Return how much joining ``lines`` onto a body with newlines adds to it."""
-    return sum(len(line) + 1 for line in lines)
-
-
 def emit_item(
     notification: dict,
     tool_shed_url: str,
     panel_label: str,
     label_map: dict | None = None,
-    tool_shed_error: Exception | None = None,
-    wrapper_request_url: str | None = None,
     pin_latest: bool = False,
 ) -> dict:
     """Turn a request into a work item.
 
-    Tool Shed failures propagate, so that the request can be tried again later,
-    unless ``tool_shed_error`` is given: then no tool is looked up, and the
-    request becomes an issue that shows the error. For tools that no Tool Shed
-    repository is named like, the issue links to ``wrapper_request_url`` filled
-    in by :func:`_wrapper_request_link`. With ``pin_latest``, tools requested without
-    a version are pinned to their newest installable revision.
+    Its ``tools`` are tool list entries for the requested tools that resolved, ``tool_ids`` the ids Galaxy gives
+    the pinned tools once installed, and ``unresolved`` says why other tools did not resolve. Tool Shed failures
+    propagate, so that the request can be tried again later. With ``pin_latest``, tools requested without a
+    version are pinned to their newest installable revision.
     """
-    content = notification["content"]
     entries: dict[tuple[str, str, bool], dict] = {}
-    rows = []
-    wrapper_links = []
-    confirmed_labels = []
-    failed = False
-    unpinned = False
-    for tool in content["tools"]:
+    tool_ids: list[str] = []
+    unresolved = []
+    for tool in notification["content"]["tools"]:
         try:
-            if tool_shed_error is not None:
-                raise Unresolved(f"not looked up, the Tool Shed failed: {tool_shed_error}")
-            owner, name, revision, version = _resolve(tool, tool_shed_url, pin_latest)
+            owner, name, revision, ids = _resolve(tool, tool_shed_url, pin_latest)
         except Unresolved as e:
-            failed = True
-            rows.append(f"| {_code(_label(tool))} | not resolved: {_code(str(e))} | |")
-            if wrapper_request_url and e.not_on_tool_shed:
-                link = _wrapper_request_link(wrapper_request_url, tool)
-                wrapper_links.append(f"- [Request a wrapper for {_code(tool['name'])}]({link})")
+            unresolved.append(f"{_label(tool)}: {e}")
             continue
         # A tool without a version follows the latest revision, so it needs an entry without revisions.
         entry = entries.setdefault(
@@ -333,87 +249,16 @@ def emit_item(
         )
         if revision and revision not in entry.setdefault("revisions", []):
             entry["revisions"].append(revision)
-        rows.append(f"| {_code(_label(tool))} | {owner}/{name} | {revision or 'latest'} |")
-        unpinned = unpinned or revision is None
-        # Versions come from the Tool Shed's metadata, so this label holds no user text.
-        confirmed_labels.append(f"{name} {version}" if version else name)
-
+        tool_ids += ids
     # Only requests that pin every tool to an installable revision skip the admins' judgement.
-    action = "pr" if entries and not failed and not unpinned else "issue"
-
-    # A pull request's title becomes its commit message, where GitHub acts on keywords like "Fixes #1".
-    labels = confirmed_labels if action == "pr" else [" ".join(_label(t).split()) for t in content["tools"]]
-    labels = list(dict.fromkeys(labels))
-    title = "Install " + ", ".join(labels[:3]) + (f" and {len(labels) - 3} more" if len(labels) > 3 else "")
-    # GitLab allows 255 characters, and GitHub 256.
-    if len(title) > 255:
-        title = title[:252] + "..."
-    body = [
-        f"Tool installation request from Galaxy (notification `{notification['id']}`).",
-        "",
-        "| Requested tool | Repository | Revision |",
-        "| --- | --- | --- |",
-        *rows,
-    ]
-    if content.get("workflow_id"):
-        body += ["", f"Needed by workflow {_code(content['workflow_id'])}."]
-    tool_list = []
-    if entries:
-        tool_list = [
-            "",
-            "Tool list entries:",
-            _code_block(yaml.safe_dump({"tools": list(entries.values())}, sort_keys=False)),
-        ]
-    free_text = []
-    for tool in content["tools"]:
-        details = [f"{key}: {tool[key]}" for key in ("tool_url", "scientific_domain", "description") if tool.get(key)]
-        if details:
-            free_text.append((f"Details for {_code(_label(tool))}:", _without_references("\n".join(details))))
-    if content.get("additional_remarks"):
-        free_text.append(("Remarks:", _without_references(content["additional_remarks"])))
-
-    # Wrapper links, then free text, get what is left of GitHub's limit. Free text is cut inside its
-    # code block, so that it stays code.
-    room = MAX_BODY_LENGTH - _size(body) + 1 - _size(tool_list) - _size(["", TRUNCATED])
-    truncated = False
-    if wrapper_links:
-        section = ["", "The Tool Shed has no repository named like these tools. If they are not wrapped yet:"]
-        for link in wrapper_links:
-            if _size(section) + _size([link]) > room:
-                truncated = True
-                break
-            section.append(link)
-        if len(section) > 2:
-            body += section
-            room -= _size(section)
-    for heading, text in [] if truncated else free_text:
-        block = ["", heading, _code_block(text)]
-        if _size(block) > room:
-            block[2] = _code_block(text[: max(0, len(text) - (_size(block) - room))])
-            if _size(block) <= room:
-                body += block
-            truncated = True
-            break
-        body += block
-        room -= _size(block)
-    if truncated:
-        body += ["", TRUNCATED]
-    body += tool_list
+    pinned = entries and not unresolved and not any(unpinned for _, _, unpinned in entries)
     return {
         "notification_id": notification["id"],
-        "action": action,
-        "title": title,
-        "body": "\n".join(body),
+        "action": "pr" if pinned else "issue",
         "tools": list(entries.values()),
+        "tool_ids": list(dict.fromkeys(tool_ids)),
+        "unresolved": unresolved,
     }
-
-
-def _waited(notification: dict) -> timedelta:
-    return datetime.now(timezone.utc) - _parse_time(notification["publication_time"])
-
-
-def _status(error: Exception) -> int | None:
-    return getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
 
 
 def emit(
@@ -421,32 +266,18 @@ def emit(
     tool_shed_url: str,
     panel_label: str,
     label_map: dict | None = None,
-    wrapper_request_url: str | None = None,
     pin_latest: bool = False,
 ) -> list[dict]:
-    """Turn requests into work items, leaving those that wait for the Tool Shed to a later run."""
+    """Turn requests into work items, leaving those the Tool Shed fails to answer for the next run."""
     items = []
-    # Set once the Tool Shed does not answer at all, so that the run stops asking it.
-    unreachable: Exception | None = None
     for notification in notifications:
-        if unreachable is not None:
-            log.warning(f"Skipping {notification['id']} until the Tool Shed answers: {unreachable}")
-            continue
         try:
-            items.append(
-                emit_item(notification, tool_shed_url, panel_label, label_map, None, wrapper_request_url, pin_latest)
-            )
-            continue
+            items.append(emit_item(notification, tool_shed_url, panel_label, label_map, pin_latest))
         except TOOL_SHED_ERRORS as e:
-            error = e
-        if _status(error) is None:
-            unreachable = error
-        if _waited(notification) < TOOL_SHED_PATIENCE:
-            log.warning(f"Skipping {notification['id']} until the Tool Shed answers: {error}")
-            continue
-        items.append(
-            emit_item(notification, tool_shed_url, panel_label, label_map, error, wrapper_request_url, pin_latest)
-        )
+            log.warning(f"Skipping {notification['id']} until the Tool Shed answers: {e}")
+            if isinstance(e, requests.ConnectionError):
+                log.warning("Skipping the other requests too, since the Tool Shed cannot be reached")
+                break
     return items
 
 
@@ -458,9 +289,10 @@ def _pinned_revisions(entry: dict) -> list:
     return entry.get("revisions") or ([entry["changeset_revision"]] if entry.get("changeset_revision") else [])
 
 
-def merge_tool_list(existing: dict | None, items: list[dict]) -> dict:
+def merge_tool_list(existing: dict | None, items: list[dict]) -> tuple[dict, list[str]]:
     """Add the tools of ``pr`` items to a tool list, extending the revisions of repositories already listed.
 
+    Return the tool list, and the notification ids of the items whose tools it added.
     Like shed-tools, an entry pins the revisions in ``revisions``, or else the one in
     ``changeset_revision``, and follows the latest revision without either. A
     repository with an entry that follows the latest revision is left alone, and a
@@ -472,13 +304,16 @@ def merge_tool_list(existing: dict | None, items: list[dict]) -> dict:
     by_repository: dict[tuple[str, str, str], list[dict]] = {}
     for tool in tools:
         by_repository.setdefault(_repository_key(tool), []).append(tool)
+    added = []
     # Issue items wait for the admins' judgement.
     for item in (i for i in items if i["action"] == "pr"):
+        changed = False
         for entry in item["tools"]:
             listed = by_repository.setdefault(_repository_key(entry), [])
             if not listed:
                 listed.append(dict(entry))
                 tools.append(listed[-1])
+                changed = True
                 continue
             pins = [_pinned_revisions(t) for t in listed]
             if not all(pins):
@@ -489,8 +324,11 @@ def merge_tool_list(existing: dict | None, items: list[dict]) -> dict:
             if new:
                 listed[-1]["revisions"] = list(pins[-1]) + new
                 listed[-1].pop("changeset_revision", None)
+                changed = True
+        if changed:
+            added.append(item["notification_id"])
     merged["tools"] = tools
-    return merged
+    return merged, added
 
 
 def fetch_notifications(gi) -> list[dict]:
@@ -510,26 +348,26 @@ def _notification(gi, notification_id: str) -> dict | None:
     return response.json()
 
 
-def reply(gi, notification_id: str, url: str | None = None, state: str = "handling") -> bool:
-    """Tell the requester how their request goes, see ``REPLIES``.
+def reply(gi, notification_ids: list[str], url: str | None = None, state: str = "handling") -> bool:
+    """Tell the requesters of these requests how their requests go, in one notification, see ``REPLIES``.
 
-    Return False if the request expired, or the requester's account is gone or they
-    turned messages off.
+    One notification counts once against Galaxy's limit of notifications an account
+    may send per minute. Return False if nobody could be told: the requests expired,
+    or the requesters' accounts are gone or they turned messages off.
     """
-    notification = _notification(gi, notification_id)
-    if notification is None:
-        return False
-    email = notification["content"].get("requester_email")
-    # The f_email filter matches substrings.
-    user_ids = (
-        [u["id"] for u in gi.users.get_users(f_email=email) if u["email"].lower() == email.lower()] if email else []
-    )
+    user_ids = []
+    for notification_id in notification_ids:
+        notification = _notification(gi, notification_id)
+        email = notification and notification["content"].get("requester_email")
+        if email:
+            # The f_email filter matches substrings.
+            user_ids += [u["id"] for u in gi.users.get_users(f_email=email) if u["email"].lower() == email.lower()]
     if not user_ids:
         return False
     response = gi.make_post_request(
         f"{gi.url}/notifications",
         payload={
-            "recipients": {"user_ids": user_ids},
+            "recipients": {"user_ids": list(dict.fromkeys(user_ids))},
             "notification": {
                 # Galaxy stores up to 32 characters.
                 "source": "tool_installation_request_reply",
@@ -570,23 +408,17 @@ def _reply_text(state: str, url: str | None) -> str:
 
 
 def installed(gi, items: list[dict]) -> list[str]:
-    """Return the notification ids of the ``pr`` items whose pinned revisions Galaxy has installed.
+    """Return the notification ids of the ``pr`` items whose tools Galaxy has loaded, in the requested versions.
 
     Only ``pr`` items pin every requested tool, so issue items are left to the admins.
     """
-    have = {
-        (_without_scheme(r["tool_shed"]), r["owner"], r["name"], revision)
-        for r in gi.toolshed.get_repositories()
-        if r["status"] == "Installed" and not r["deleted"]
-        for revision in (r["changeset_revision"], r["installed_changeset_revision"])
-    }
+    response = gi.make_get_request(f"{gi.url}/tools", params={"in_panel": False})
+    response.raise_for_status()
+    loaded = {tool["id"] for tool in response.json()}
     return [
         item["notification_id"]
         for item in items
-        if item["action"] == "pr"
-        and all(
-            (*_repository_key(entry), revision) in have for entry in item["tools"] for revision in entry["revisions"]
-        )
+        if item["action"] == "pr" and item["tool_ids"] and loaded.issuperset(item["tool_ids"])
     ]
 
 
@@ -598,7 +430,7 @@ def mark_seen(gi, notification_ids: list[str]) -> None:
 
 def _parser():
     parser = argparse.ArgumentParser(
-        description="Turn Galaxy tool installation requests into issues and pull requests for a tool list repository.",
+        description="Turn Galaxy tool installation requests into work for a tool list repository.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     galaxy_arguments = get_common_args(log_file=True)
@@ -628,12 +460,6 @@ def _parser():
         dest="panel_label_json",
         help="JSON file or URL mapping 'owner/name' to a tool panel section label, overriding -l.",
     )
-    emit.add_argument(
-        "--wrapper-request-url",
-        help="URL that issues link to for tools no Tool Shed repository is named like, such as a new issue in "
-        "a tool development repository. {name}, {url}, {description}, {domain}, {title} and {body} in it "
-        "are replaced with what the user said about the tool.",
-    )
 
     # render-yaml needs no Galaxy.
     render = subparsers.add_parser(
@@ -644,15 +470,20 @@ def _parser():
     add_verbosity_argument(render)
     add_log_file_argument(render)
     render.add_argument("--tools-file", help="Tool list to merge into.")
-    render.add_argument("-o", "--output", help="Where to write the tool list (default: stdout).")
+    render.add_argument(
+        "-o",
+        "--output",
+        help="Where to write the tool list (default: stdout). Then the notification ids of the items whose tools "
+        "were added are printed, one per line.",
+    )
 
     reply = subparsers.add_parser(
         "reply",
         parents=[galaxy_arguments],
         formatter_class=HideUnderscoresHelpFormatter,
-        help="Tell the requester where their request is handled, or how it ended.",
+        help="Tell the requesters of requests where they are handled, or how they ended, in one notification.",
     )
-    reply.add_argument("--notification-id", required=True, help="The request to answer.")
+    reply.add_argument("notification_ids", nargs="+", metavar="notification_id", help="Requests to answer.")
     reply.add_argument("--url", help="Issue or pull request URL, required for --state handling.")
     reply.add_argument(
         "--state",
@@ -666,7 +497,7 @@ def _parser():
         "installed",
         parents=[galaxy_arguments],
         formatter_class=HideUnderscoresHelpFormatter,
-        help="Print the notification ids of the pr work items on stdin whose tools Galaxy has installed.",
+        help="Print the notification ids of the pr work items on stdin whose tools Galaxy has loaded.",
     )
 
     mark_seen = subparsers.add_parser(
@@ -687,21 +518,24 @@ def main(argv=None):
     if args.command == "render-yaml":
         items = json.load(sys.stdin)
         existing = load_yaml_file(args.tools_file) if args.tools_file and os.path.exists(args.tools_file) else None
-        merged = merge_tool_list(existing, items)
-        if existing is not None and merged == existing:
-            # Keep the comments and formatting of a tool list that gains nothing.
-            with open(args.tools_file) as f:
+        merged, added = merge_tool_list(existing, items)
+        if not added and args.tools_file and os.path.exists(args.tools_file):
+            # Keep the comments, formatting and line endings of a tool list that gains nothing.
+            with open(args.tools_file, newline="") as f:
                 output = f.read()
         else:
             output = yaml.safe_dump(merged, sort_keys=False)
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", newline="") as f:
                 f.write(output)
+            for notification_id in added:
+                print(notification_id)
         else:
             sys.stdout.write(output)
         return
 
     gi = get_galaxy_connection(args, log=log, login_required=True)
+    gi.timeout = TIMEOUT
     if args.command == "emit":
         label_map = None
         if args.panel_label_json:
@@ -716,9 +550,9 @@ def main(argv=None):
             return 1
         pending = select_requests(notifications)
         shed_url = format_tool_shed_url(args.tool_shed_url)
-        items = emit(pending, shed_url, args.panel_label, label_map, args.wrapper_request_url, args.pin_latest)
+        items = emit(pending, shed_url, args.panel_label, label_map, args.pin_latest)
         for item in items:
-            log.info(f"{item['notification_id']}: {item['action']} {item['title']}")
+            log.info(f"{item['notification_id']}: {item['action']} {', '.join(item['unresolved'])}")
         json.dump(items, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.command == "reply":
@@ -726,15 +560,15 @@ def main(argv=None):
             log.error("--state handling needs --url")
             return 2
         try:
-            sent = reply(gi, args.notification_id, args.url, args.state)
+            sent = reply(gi, args.notification_ids, args.url, args.state)
         except (ReplyFailed, BioblendError, OSError) as e:
             # For example, Galaxy limits how many notifications an account may send per minute.
-            log.error(f"Could not tell the requester of {args.notification_id}: {e}")
+            log.error(f"Could not tell the requesters of {' '.join(args.notification_ids)}: {e}")
             return 1
         if not sent:
             log.warning(
-                f"The request {args.notification_id} expired, or its requester has no Galaxy account anymore or "
-                "turned messages off, so they were not told"
+                f"The requests {' '.join(args.notification_ids)} expired, or their requesters have no Galaxy account "
+                "anymore or turned messages off, so they were not told"
             )
     elif args.command == "installed":
         try:
