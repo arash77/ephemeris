@@ -27,7 +27,7 @@ requests that pin their tools, and tell those requesters where it is. For
 example, in GitHub Actions, with ``EPHEMERIS_GALAXY``, ``EPHEMERIS_API_KEY``
 and ``GH_TOKEN`` set::
 
-    consume-tool-installation-requests emit > requests.json
+    consume-tool-installation-requests emit --pin-latest > requests.json
     git switch -c "tool-requests-$(date +%s)"
     added=$(consume-tool-installation-requests render-yaml --tools-file requested_tools.yaml -o requested_tools.yaml < requests.json)
     if [ -n "$added" ]; then
@@ -40,6 +40,11 @@ and ``GH_TOKEN`` set::
     fi
     others=$(jq -r '.[].notification_id' requests.json | grep -vxF "$added" || true)
     [ -z "$others" ] || consume-tool-installation-requests mark-seen $others
+
+``--pin-latest`` pins tools requested without a version to their newest
+installable revision, so that those requests get a pull request too. A typed
+tool name can match a repository other than the one the user meant, so check
+the repositories in each pull request before merging it.
 
 ``render-yaml -o`` prints the requests whose tools it added. They get the pull
 request, and one notification tells all their requesters. The job marks the
