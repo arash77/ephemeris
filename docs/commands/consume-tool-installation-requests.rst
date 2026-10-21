@@ -18,7 +18,9 @@ Galaxy sends tool installation requests to its admins when
 ``enable_tool_installation_request_form`` and ``enable_notification_system``
 are both enabled. The API key must belong to an account in Galaxy's
 ``admin_users`` that keeps tool installation requests turned on in its
-notification preferences.
+notification preferences. Give the job an admin account of its own: Galaxy
+tracks what each account has seen, so admins can then read requests in Galaxy
+without the job skipping them.
 
 A scheduled job in your tool list repository can open a pull request with the
 requests that pin their tools, and tell those requesters where it is. For
