@@ -228,6 +228,15 @@ def test_emit_falls_back_to_an_issue():
     assert by_id["action"] == "pr"
 
 
+def test_emit_leaves_local_workflow_tools_to_the_admins(fake_tool_shed):
+    shed = fake_tool_shed()
+    # Galaxy sends a workflow's tools that are not from a Tool Shed by their local id only.
+    item = _emit("0aab0e4c25198ad8", tools=[{"name": "fastp"}])
+    assert item["action"] == "issue"
+    assert item["unresolved"] == ["fastp: a tool of the workflow that is not from a Tool Shed"]
+    assert shed.requests == []
+
+
 def test_emit_looks_tool_names_up_exactly(fake_tool_shed):
     shed = fake_tool_shed()
     item = _emit(

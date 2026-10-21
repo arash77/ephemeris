@@ -232,6 +232,10 @@ def emit_item(
     tool_ids: list[str] = []
     unresolved = []
     for tool in notification["content"]["tools"]:
+        if notification["content"].get("workflow_id") and not tool.get("tool_shed_id"):
+            # A workflow names its local tools by id, which may match an unrelated repository's name.
+            unresolved.append(f"{_label(tool)}: a tool of the workflow that is not from a Tool Shed")
+            continue
         try:
             owner, name, revision, ids = _resolve(tool, tool_shed_url, pin_latest)
         except Unresolved as e:

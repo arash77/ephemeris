@@ -49,7 +49,8 @@ the repositories in each pull request before merging it.
 ``render-yaml -o`` prints the requests whose tools it added. They get the pull
 request, and one notification tells all their requesters. The job marks the
 other requests seen too, so that it does not look them up again; admins find
-them in their own notifications. If the reply fails, the requesters are not
+them in their own notifications, which they can also get by email in their
+notification preferences. If the reply fails, the requesters are not
 told about the pull request, but the job does not open it twice.
 
 The job needs the ``contents: write`` and ``pull-requests: write``
